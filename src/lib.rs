@@ -36,13 +36,14 @@ mod value;
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, LinkedList, VecDeque};
     use std::fmt;
     use std::marker::PhantomData;
 
     use bytes::Bytes;
     use destream::de::{self, ArrayAccess, FromStream};
     use destream::en::IntoStream;
+    use destream::IgnoredAny;
     use futures::future;
     use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 
@@ -108,6 +109,16 @@ mod tests {
         test_encode(encode_map(map), expected).await;
     }
 
+    async fn roundtrip<T>(value: T)
+    where
+        T: FromStream<Context = ()> + PartialEq + fmt::Debug,
+        for<'en> T: destream::en::ToStream<'en>,
+    {
+        let encoded = encode(&value).unwrap();
+        let decoded: T = try_decode((), encoded).await.unwrap();
+        assert_eq!(decoded, value);
+    }
+
     async fn assert_decode_fails<T: FromStream<Context = ()>>(encoded: &str) {
         for chunk_size in 1..=encoded.len().max(1).min(8) {
             let source = stream::iter(encoded.as_bytes().iter().copied())
@@ -146,6 +157,64 @@ mod tests {
         for i in 0..encoded.len() {
             assert_decode_fails::<HashMap<String, u8>>(&encoded[..i]).await;
         }
+    }
+
+    #[tokio::test]
+    async fn test_default_impl_roundtrips() {
+        roundtrip(()).await;
+
+        roundtrip(true).await;
+        roundtrip(false).await;
+
+        roundtrip(1u8).await;
+        roundtrip(65_535u16).await;
+        roundtrip(1_000_000u32).await;
+        roundtrip(9_223_372_036_854_775_808u64).await;
+
+        roundtrip(-1i8).await;
+        roundtrip(-32_000i16).await;
+        roundtrip(1_000_000i32).await;
+        roundtrip(-9_000_000_000_000_000_000i64).await;
+
+        roundtrip(3.25f32).await;
+        roundtrip(-14140.0f64).await;
+
+        roundtrip("hello world".to_string()).await;
+        roundtrip("string \"within\" string".to_string()).await;
+
+        roundtrip(Some(123u8)).await;
+        roundtrip::<Option<u8>>(None).await;
+
+        roundtrip(vec![1i32, 2, 3, 4]).await;
+        roundtrip(VecDeque::from([1u8, 2, 3, 4])).await;
+        roundtrip(LinkedList::from(["a".to_string(), "b".to_string()])).await;
+
+        let array = [1u8, 2, 3, 4];
+        let array_ref: &[u8; 4] = &array;
+        let encoded = encode(&array_ref).unwrap();
+        let decoded: [u8; 4] = try_decode((), encoded).await.unwrap();
+        assert_eq!(decoded, array);
+        roundtrip((true, 7u8, "x".to_string(), None::<i32>)).await;
+
+        let map: HashMap<String, i32> =
+            HashMap::from_iter([("a".to_string(), 1i32), ("b".to_string(), -2i32)]);
+        roundtrip(map).await;
+
+        let map = BTreeMap::from_iter([("a".to_string(), true), ("b".to_string(), false)]);
+        roundtrip(map).await;
+
+        roundtrip(HashSet::from([1u8, 2u8, 3u8])).await;
+        roundtrip(BTreeSet::from([1u8, 2u8, 3u8])).await;
+
+        // This is a non-standard JSON extension, but it's a useful default impl
+        // conformance check: `HashMap<K, V>` roundtrips even when `K` is not `String`.
+        roundtrip(HashMap::<u8, u8>::from_iter([(1u8, 2u8), (3u8, 4u8)])).await;
+
+        // IgnoredAny must be able to consume any JSON value.
+        let source = stream::iter(br#"{"a":[1,2,{"b":true}],"c":null}"#.iter().copied())
+            .chunks(3)
+            .map(Bytes::from);
+        let _: IgnoredAny = decode((), source).await.unwrap();
     }
 
     #[tokio::test]
