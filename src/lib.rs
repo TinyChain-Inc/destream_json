@@ -107,6 +107,46 @@ mod tests {
         test_encode(encode_map(map), expected).await;
     }
 
+    async fn assert_decode_fails<T: FromStream<Context = ()>>(encoded: &str) {
+        for chunk_size in 1..=encoded.len().max(1).min(8) {
+            let source = stream::iter(encoded.as_bytes().iter().copied())
+                .chunks(chunk_size)
+                .map(Bytes::from);
+
+            let result: Result<T, _> = decode((), source).await;
+            assert!(result.is_err(), "expected decode to fail, but succeeded");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_truncated_inputs() {
+        let encoded = "true";
+        test_decode(encoded, true).await;
+        for i in 0..encoded.len() {
+            assert_decode_fails::<bool>(&encoded[..i]).await;
+        }
+
+        let encoded = "\"hello world\"";
+        test_decode(encoded, "hello world".to_string()).await;
+        for i in 0..encoded.len() {
+            assert_decode_fails::<String>(&encoded[..i]).await;
+        }
+
+        let encoded = "[1,2,3]";
+        test_decode(encoded, vec![1u8, 2, 3]).await;
+        for i in 0..encoded.len() {
+            assert_decode_fails::<Vec<u8>>(&encoded[..i]).await;
+        }
+
+        let encoded = "{\"a\":1,\"b\":2}";
+        let expected =
+            HashMap::<String, u8>::from_iter([("a".to_string(), 1u8), ("b".to_string(), 2u8)]);
+        test_decode(encoded, expected).await;
+        for i in 0..encoded.len() {
+            assert_decode_fails::<HashMap<String, u8>>(&encoded[..i]).await;
+        }
+    }
+
     #[tokio::test]
     async fn test_json_primitives() {
         test_decode("null", ()).await;
