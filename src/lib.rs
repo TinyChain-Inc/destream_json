@@ -39,6 +39,9 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, LinkedList, VecDeque};
     use std::fmt;
     use std::marker::PhantomData;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    use std::num::{NonZeroI128, NonZeroU128};
+    use std::time::Duration;
 
     use bytes::Bytes;
     use destream::de::{self, ArrayAccess, FromStream};
@@ -210,11 +213,57 @@ mod tests {
         // conformance check: `HashMap<K, V>` roundtrips even when `K` is not `String`.
         roundtrip(HashMap::<u8, u8>::from_iter([(1u8, 2u8), (3u8, 4u8)])).await;
 
+        roundtrip(i128::MAX).await;
+        roundtrip(u128::MAX).await;
+        roundtrip(NonZeroI128::new(-5_i128).unwrap()).await;
+        roundtrip(NonZeroU128::new(5_u128).unwrap()).await;
+
+        roundtrip(Duration::new(5, 7)).await;
+
+        roundtrip(Ipv4Addr::new(127, 0, 0, 1)).await;
+        roundtrip(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)).await;
+        roundtrip(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))).await;
+        roundtrip(SocketAddr::from((Ipv4Addr::new(127, 0, 0, 1), 80))).await;
+
         // IgnoredAny must be able to consume any JSON value.
         let source = stream::iter(br#"{"a":[1,2,{"b":true}],"c":null}"#.iter().copied())
             .chunks(3)
             .map(Bytes::from);
         let _: IgnoredAny = decode((), source).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_extended_default_impl_numeric_tokens() {
+        test_decode("123", 123_i128).await;
+        test_decode("-123", -123_i128).await;
+        test_decode("123", 123_u128).await;
+
+        // Larger-than-`u64` numeric tokens must fail (JSON numbers are not self-describing beyond
+        // the decoder's native numeric range).
+        assert_decode_fails::<u128>("18446744073709551616").await; // u64::MAX + 1
+
+        // Very large numbers are parsed as floats and should not decode into an integer type.
+        assert_decode_fails::<i128>("1e40").await;
+    }
+
+    #[tokio::test]
+    async fn test_extended_default_impl_decode_errors() {
+        assert_decode_fails::<u128>("-1").await;
+        assert_decode_fails::<NonZeroU128>("0").await;
+        assert_decode_fails::<NonZeroI128>("0").await;
+
+        assert_decode_fails::<u128>(&format!("\"{}0\"", u128::MAX)).await;
+        assert_decode_fails::<i128>(&format!("\"{}0\"", i128::MAX)).await;
+
+        assert_decode_fails::<Duration>("[5]").await;
+        assert_decode_fails::<Duration>("[5,\"7\"]").await;
+        assert_decode_fails::<Duration>("[5,7,9]").await;
+        assert_decode_fails::<Duration>(&format!("[5,{}]", 1_000_000_000_u64)).await;
+
+        assert_decode_fails::<Ipv4Addr>("\"999.0.0.1\"").await;
+        assert_decode_fails::<Ipv6Addr>("\"not an ip\"").await;
+        assert_decode_fails::<IpAddr>("\"not an ip\"").await;
+        assert_decode_fails::<SocketAddr>("\"127.0.0.1\"").await;
     }
 
     #[tokio::test]
@@ -765,16 +814,12 @@ mod tests {
         use std::io;
         use std::path::PathBuf;
 
-        use number_general::Number;
         use tokio_util::io::StreamReader;
 
         let mut value = HashMap::new();
-        value.insert("one".to_string(), Some(Number::from(1)));
+        value.insert("one".to_string(), Some(1.0_f64));
         value.insert("two".to_string(), None);
-        value.insert(
-            "three".to_string(),
-            Some(Number::from(std::f32::consts::PI)),
-        );
+        value.insert("three".to_string(), Some(std::f64::consts::PI));
 
         let path = PathBuf::from(".tmp");
 
