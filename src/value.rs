@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use async_trait::async_trait;
 use destream::de::{self, Decoder, FromStream, MapAccess, SeqAccess, Visitor};
 use destream::en::{Encoder, IntoStream, ToStream};
 use number_general::Number;
@@ -68,7 +67,6 @@ impl From<String> for Value {
 
 struct ValueVisitor;
 
-#[async_trait]
 impl Visitor for ValueVisitor {
     type Value = Value;
 
@@ -157,7 +155,6 @@ impl Visitor for ValueVisitor {
     }
 }
 
-#[async_trait]
 impl FromStream for Value {
     type Context = ();
 
