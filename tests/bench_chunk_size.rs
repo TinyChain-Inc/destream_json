@@ -89,4 +89,3 @@ async fn bench_decode_chunk_sizes() {
         );
     }
 }
-

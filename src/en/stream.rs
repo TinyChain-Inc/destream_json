@@ -1,7 +1,8 @@
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::task::{self, Poll};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use destream::en::{self, IntoStream};
 use futures::ready;
 use futures::stream::{Fuse, FusedStream, Stream, StreamExt};
@@ -30,6 +31,13 @@ impl<'en> JSONMapEntryStream<'en> {
             key: key.fuse(),
             value: value.fuse(),
         })
+    }
+
+    pub(super) fn from_streams(key: JSONStream<'en>, value: JSONStream<'en>) -> Self {
+        Self {
+            key: key.fuse(),
+            value: value.fuse(),
+        }
     }
 }
 
@@ -158,5 +166,129 @@ pub fn encode_map<
         finished: false,
         start: MAP_BEGIN,
         end: MAP_END,
+    }
+}
+
+pub(super) fn encode_list_encoded<'en>(items: VecDeque<JSONStream<'en>>) -> JSONStream<'en> {
+    let source = futures::stream::iter(items.into_iter().map(Ok));
+
+    Box::pin(JSONEncodingStream {
+        source: source.fuse(),
+        next: None,
+        started: false,
+        finished: false,
+        start: LIST_BEGIN,
+        end: LIST_END,
+    })
+}
+
+pub(super) fn encode_map_encoded<'en>(
+    entries: VecDeque<(JSONStream<'en>, JSONStream<'en>)>,
+) -> JSONStream<'en> {
+    let source = futures::stream::iter(
+        entries
+            .into_iter()
+            .map(|(key, value)| Ok(JSONMapEntryStream::from_streams(key, value))),
+    );
+
+    Box::pin(JSONEncodingStream {
+        source: source.fuse(),
+        next: None,
+        started: false,
+        finished: false,
+        start: MAP_BEGIN,
+        end: MAP_END,
+    })
+}
+
+#[pin_project]
+pub(crate) struct CoalesceStream<S> {
+    #[pin]
+    source: S,
+    buffer: BytesMut,
+    pending: Option<Bytes>,
+    target: usize,
+    done: bool,
+}
+
+impl<S> CoalesceStream<S> {
+    pub(crate) fn new(source: S, target: usize) -> Self {
+        assert!(target > 0);
+
+        Self {
+            source,
+            buffer: BytesMut::with_capacity(target),
+            pending: None,
+            target,
+            done: false,
+        }
+    }
+}
+
+impl<S: Stream<Item = Result<Bytes, super::Error>>> Stream for CoalesceStream<S> {
+    type Item = Result<Bytes, super::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cxt: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut this = self.project();
+
+        if *this.done {
+            return Poll::Ready(None);
+        }
+
+        if this.buffer.len() >= *this.target {
+            let out = this.buffer.split().freeze();
+            return Poll::Ready(Some(Ok(out)));
+        }
+
+        if let Some(pending) = this.pending.take() {
+            if this.buffer.is_empty() && pending.len() >= *this.target {
+                return Poll::Ready(Some(Ok(pending)));
+            } else {
+                this.buffer.extend_from_slice(&pending);
+                if this.buffer.len() >= *this.target {
+                    let out = this.buffer.split().freeze();
+                    return Poll::Ready(Some(Ok(out)));
+                }
+            }
+        }
+
+        loop {
+            match ready!(this.source.as_mut().poll_next(cxt)) {
+                Some(Ok(chunk)) => {
+                    if chunk.is_empty() {
+                        continue;
+                    }
+
+                    if chunk.len() >= *this.target {
+                        if this.buffer.is_empty() {
+                            break Poll::Ready(Some(Ok(chunk)));
+                        } else {
+                            *this.pending = Some(chunk);
+                            let out = this.buffer.split().freeze();
+                            break Poll::Ready(Some(Ok(out)));
+                        }
+                    } else {
+                        this.buffer.extend_from_slice(&chunk);
+                        if this.buffer.len() >= *this.target {
+                            let out = this.buffer.split().freeze();
+                            break Poll::Ready(Some(Ok(out)));
+                        }
+                    }
+                }
+                Some(Err(cause)) => {
+                    *this.done = true;
+                    break Poll::Ready(Some(Err(cause)));
+                }
+                None => {
+                    *this.done = true;
+                    if this.buffer.is_empty() {
+                        break Poll::Ready(None);
+                    } else {
+                        let out = this.buffer.split().freeze();
+                        break Poll::Ready(Some(Ok(out)));
+                    }
+                }
+            }
+        }
     }
 }

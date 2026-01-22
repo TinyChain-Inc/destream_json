@@ -12,6 +12,23 @@ pub const MAP_BEGIN: &[u8] = b"{";
 pub const MAP_END: &[u8] = b"}";
 pub const QUOTE: &[u8] = b"\"";
 
+pub const SPACE: u8 = b' ';
+pub const TAB: u8 = b'\t';
+pub const LF: u8 = b'\n';
+pub const CR: u8 = b'\r';
+pub const BACKSPACE: u8 = 0x08;
+pub const FORM_FEED: u8 = 0x0C;
+
+pub const ESCAPED_QUOTE: &[u8] = b"\\\"";
+pub const ESCAPED_BACKSLASH: &[u8] = b"\\\\";
+pub const ESCAPED_SLASH: &[u8] = b"\\/";
+pub const ESCAPED_BACKSPACE: &[u8] = b"\\b";
+pub const ESCAPED_FORM_FEED: &[u8] = b"\\f";
+pub const ESCAPED_NEWLINE: &[u8] = b"\\n";
+pub const ESCAPED_RETURN: &[u8] = b"\\r";
+pub const ESCAPED_TAB: &[u8] = b"\\t";
+pub const UNICODE_ESCAPE_PREFIX: &[u8] = b"\\u00";
+
 // Lookup table of bytes that must be escaped. A value of true at
 // index i means that byte i requires an escape sequence in the input.
 // taken from

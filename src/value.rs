@@ -1,23 +1,19 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::str::FromStr;
 
 use destream::de::{self, Decoder, FromStream, MapAccess, SeqAccess, Visitor};
-use destream::en::{Encoder, IntoStream, ToStream};
+use destream::en::{self, Encoder, IntoStream, ToStream};
 use number_general::Number;
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Default, Eq, PartialEq)]
 pub enum Value {
     List(Vec<Value>),
     Map(HashMap<String, Value>),
+    #[default]
     None,
     Number(Number),
     String(String),
-}
-
-impl Default for Value {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 impl FromIterator<Value> for Value {
@@ -159,7 +155,7 @@ impl FromStream for Value {
     type Context = ();
 
     async fn from_stream<D: Decoder>(_: (), decoder: &mut D) -> Result<Self, D::Error> {
-        decoder.decode_any(ValueVisitor).await
+        Box::pin(decoder.decode_any(ValueVisitor)).await
     }
 }
 
@@ -169,7 +165,30 @@ impl<'en> IntoStream<'en> for Value {
             Self::List(list) => list.into_stream(encoder),
             Self::None => ().into_stream(encoder),
             Self::Map(map) => map.into_stream(encoder),
-            Self::Number(n) => n.into_stream(encoder),
+            Self::Number(n) => match n {
+                Number::Complex(_) => {
+                    Err(en::Error::custom("cannot encode a complex number as JSON"))
+                }
+                Number::Bool(_) => encoder.encode_bool(n.to_string().as_str() == "true"),
+                Number::Int(_) => {
+                    let v = i64::from_str(&n.to_string()).map_err(|e| {
+                        en::Error::custom(format!("cannot encode JSON number as i64: {e}"))
+                    })?;
+                    encoder.encode_i64(v)
+                }
+                Number::UInt(_) => {
+                    let v = u64::from_str(&n.to_string()).map_err(|e| {
+                        en::Error::custom(format!("cannot encode JSON number as u64: {e}"))
+                    })?;
+                    encoder.encode_u64(v)
+                }
+                Number::Float(_) => {
+                    let v = f64::from_str(&n.to_string()).map_err(|e| {
+                        en::Error::custom(format!("cannot encode JSON number as f64: {e}"))
+                    })?;
+                    encoder.encode_f64(v)
+                }
+            },
             Self::String(s) => s.into_stream(encoder),
         }
     }
@@ -181,7 +200,7 @@ impl<'en> ToStream<'en> for Value {
             Self::List(list) => list.to_stream(encoder),
             Self::None => ().into_stream(encoder),
             Self::Map(map) => map.to_stream(encoder),
-            Self::Number(n) => n.to_stream(encoder),
+            Self::Number(n) => Value::Number(*n).into_stream(encoder),
             Self::String(s) => s.to_stream(encoder),
         }
     }

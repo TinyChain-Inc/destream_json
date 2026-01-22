@@ -98,25 +98,13 @@ impl<'en> en::EncodeMap<'en> for MapEncoder<'en> {
         Ok(())
     }
 
-    fn end(mut self) -> Result<Self::Ok, Self::Error> {
+    fn end(self) -> Result<Self::Ok, Self::Error> {
         if self.pending_key.is_some() {
             return Err(en::Error::custom(
                 "You must call encode_value after calling encode_key",
             ));
         }
-
-        let mut encoded = delimiter(MAP_BEGIN);
-
-        while let Some((key, value)) = self.entries.pop_front() {
-            encoded = Box::pin(encoded.chain(key).chain(delimiter(COLON)).chain(value));
-
-            if !self.entries.is_empty() {
-                encoded = Box::pin(encoded.chain(delimiter(COMMA)));
-            }
-        }
-
-        encoded = Box::pin(encoded.chain(delimiter(MAP_END)));
-        Ok(encoded)
+        Ok(stream::encode_map_encoded(self.entries))
     }
 }
 
@@ -141,19 +129,8 @@ impl<'en> SequenceEncoder<'en> {
         self.items.push_back(value);
     }
 
-    fn encode(mut self) -> Result<JSONStream<'en>, Error> {
-        let mut encoded = delimiter(LIST_BEGIN);
-
-        while let Some(item) = self.items.pop_front() {
-            encoded = Box::pin(encoded.chain(item));
-
-            if !self.items.is_empty() {
-                encoded = Box::pin(encoded.chain(delimiter(COMMA)));
-            }
-        }
-
-        encoded = Box::pin(encoded.chain(delimiter(LIST_END)));
-        Ok(encoded)
+    fn encode(self) -> Result<JSONStream<'en>, Error> {
+        Ok(stream::encode_list_encoded(self.items))
     }
 }
 
@@ -439,7 +416,7 @@ impl<'en> en::Encoder<'en> for Encoder {
 
     #[inline]
     fn encode_str(self, v: &str) -> Result<Self::Ok, Self::Error> {
-        let mut chunk = BytesMut::with_capacity(v.as_bytes().len() + 2);
+        let mut chunk = BytesMut::with_capacity(v.len() + 2);
         chunk.extend_from_slice(QUOTE);
         chunk.extend(escape(v));
         chunk.extend_from_slice(QUOTE);
@@ -513,16 +490,36 @@ impl<'en> en::Encoder<'en> for Encoder {
 fn escape<T: fmt::Display>(value: T) -> Bytes {
     let as_str = value.to_string();
     let mut encoded = BytesMut::with_capacity(as_str.len());
-    for byte in as_str.as_bytes() {
-        let as_slice = std::slice::from_ref(byte);
-        if as_slice == QUOTE || as_slice == ESCAPE {
-            encoded.extend_from_slice(ESCAPE);
+    for &byte in as_str.as_bytes() {
+        match byte {
+            b'"' => encoded.extend_from_slice(ESCAPED_QUOTE),
+            b'\\' => encoded.extend_from_slice(ESCAPED_BACKSLASH),
+            b'/' => encoded.extend_from_slice(ESCAPED_SLASH),
+            LF => encoded.extend_from_slice(ESCAPED_NEWLINE),
+            CR => encoded.extend_from_slice(ESCAPED_RETURN),
+            TAB => encoded.extend_from_slice(ESCAPED_TAB),
+            BACKSPACE => encoded.extend_from_slice(ESCAPED_BACKSPACE),
+            FORM_FEED => encoded.extend_from_slice(ESCAPED_FORM_FEED),
+            0x00..=0x1F => {
+                encoded.extend_from_slice(UNICODE_ESCAPE_PREFIX);
+                encoded.put_u8(hex_digit(byte >> 4));
+                encoded.put_u8(hex_digit(byte & 0x0F));
+            }
+            _ => encoded.put_u8(byte),
         }
-
-        encoded.put_u8(*byte);
     }
 
     encoded.into()
+}
+
+#[inline]
+fn hex_digit(val: u8) -> u8 {
+    debug_assert!(val < 16);
+    match val {
+        0..=9 => b'0' + val,
+        10..=15 => b'a' + (val - 10),
+        _ => unreachable!(),
+    }
 }
 
 #[inline]
@@ -532,16 +529,25 @@ fn encode_fmt<'en, T: fmt::Display>(value: T) -> JSONStream<'en> {
 }
 
 #[inline]
-fn delimiter<'en>(delimiter: &'static [u8]) -> JSONStream<'en> {
-    let encoded = futures::stream::once(future::ready(Ok(Bytes::from_static(delimiter))));
-    Box::pin(encoded)
-}
-
 /// Given an encodable value, return an encoded stream.
 pub fn encode<'en, T: IntoStream<'en> + 'en>(
     value: T,
 ) -> Result<impl Stream<Item = Result<Bytes, Error>> + Send + Unpin + 'en, Error> {
     value.into_stream(Encoder)
+}
+
+/// Given an encodable value, return an encoded stream buffered into chunks of `target` bytes.
+///
+/// This can reduce downstream overhead when the returned stream is consumed by an IO layer which
+/// performs one `await`/write per chunk.
+pub fn encode_buffered<'en, T: IntoStream<'en> + 'en>(
+    value: T,
+    target: usize,
+) -> Result<impl Stream<Item = Result<Bytes, Error>> + Send + Unpin + 'en, Error> {
+    Ok(stream::CoalesceStream::new(
+        value.into_stream(Encoder)?,
+        target,
+    ))
 }
 
 /// Given a stream of encodable key-value pairs, return a streaming JSON object.
@@ -556,9 +562,36 @@ pub fn encode_map<
     stream::encode_map(seq)
 }
 
+/// Given a stream of encodable key-value pairs, return a streaming JSON object buffered into
+/// chunks of `target` bytes.
+pub fn encode_map_buffered<
+    'en,
+    K: IntoStream<'en> + 'en,
+    V: IntoStream<'en> + 'en,
+    S: Stream<Item = (K, V)> + Send + Unpin + 'en,
+>(
+    seq: S,
+    target: usize,
+) -> impl Stream<Item = Result<Bytes, Error>> + Send + Unpin + 'en {
+    stream::CoalesceStream::new(stream::encode_map(seq), target)
+}
+
 /// Given a stream of encodable elements, return a streaming JSON list.
 pub fn encode_seq<'en, T: IntoStream<'en> + 'en, S: Stream<Item = T> + Send + Unpin + 'en>(
     seq: S,
 ) -> impl Stream<Item = Result<Bytes, Error>> + Send + Unpin + 'en {
     stream::encode_list(seq)
+}
+
+/// Given a stream of encodable elements, return a streaming JSON list buffered into chunks of
+/// `target` bytes.
+pub fn encode_seq_buffered<
+    'en,
+    T: IntoStream<'en> + 'en,
+    S: Stream<Item = T> + Send + Unpin + 'en,
+>(
+    seq: S,
+    target: usize,
+) -> impl Stream<Item = Result<Bytes, Error>> + Send + Unpin + 'en {
+    stream::CoalesceStream::new(stream::encode_list(seq), target)
 }
