@@ -15,3 +15,9 @@ let stream = destream_json::encode(&expected).unwrap();
 let actual = destream_json::try_decode((), stream).await;
 assert_eq!(expected, actual);
 ```
+
+## Chunk-size micro-benchmark
+
+To inspect decode performance sensitivity to input chunk size:
+
+`cargo test --test bench_chunk_size -- --ignored --nocapture`

@@ -1,12 +1,11 @@
 //! Decode a JSON stream to a Rust data structure.
 
-use std::collections::HashSet;
 use std::fmt;
 use std::future::Future;
 use std::str::FromStr;
 
 use async_recursion::async_recursion;
-use bytes::{BufMut, Bytes};
+use bytes::Bytes;
 use destream::{de, FromStream, Visitor};
 use futures::stream::{Fuse, FusedStream, Stream, StreamExt, TryStreamExt};
 
@@ -281,7 +280,7 @@ impl<'a, S: Read + 'a, T: FromStream<Context = ()> + 'a> de::ArrayAccess<T> for 
 pub struct Decoder<S> {
     source: S,
     buffer: Vec<u8>,
-    numeric: HashSet<u8>,
+    offset: usize,
 }
 
 #[cfg(feature = "tokio-io")]
@@ -293,15 +292,44 @@ where
         Decoder {
             source: SourceReader::from(reader),
             buffer: Vec::new(),
-            numeric: NUMERIC.iter().cloned().collect(),
+            offset: 0,
         }
     }
 }
 
 impl<S> Decoder<S> {
+    fn remaining(&self) -> usize {
+        self.buffer.len().saturating_sub(self.offset)
+    }
+
+    fn available(&self) -> &[u8] {
+        &self.buffer[self.offset..]
+    }
+
+    fn maybe_compact(&mut self) {
+        if self.offset == 0 {
+            return;
+        }
+
+        if self.offset == self.buffer.len() {
+            self.buffer.clear();
+            self.offset = 0;
+        } else if self.offset > 8192 && self.offset > self.buffer.len() / 2 {
+            self.buffer.drain(..self.offset);
+            self.offset = 0;
+        }
+    }
+
+    fn consume(&mut self, n: usize) {
+        debug_assert!(self.remaining() >= n);
+        self.offset += n;
+        self.maybe_compact();
+    }
+
     fn contents(&self, max_len: usize) -> Result<String, Error> {
-        let len = Ord::min(self.buffer.len(), max_len);
-        String::from_utf8(self.buffer[..len].to_vec()).map_err(Error::invalid_utf8)
+        let buf = self.available();
+        let len = Ord::min(buf.len(), max_len);
+        String::from_utf8(buf[..len].to_vec()).map_err(Error::invalid_utf8)
     }
 }
 
@@ -314,19 +342,20 @@ where
         Decoder {
             source: SourceStream::from(stream),
             buffer: Vec::new(),
-            numeric: NUMERIC.iter().cloned().collect(),
+            offset: 0,
         }
     }
 
     /// Return `true` if this [`Decoder`] has no more data to be decoded.
     pub fn is_terminated(&self) -> bool {
-        self.source.is_terminated()
+        self.source.is_terminated() && self.remaining() == 0
     }
 }
 
 impl<S: Read> Decoder<S> {
     async fn buffer(&mut self) -> Result<(), Error> {
         if let Some(data) = self.source.next().await {
+            self.maybe_compact();
             self.buffer.extend(data?);
         }
 
@@ -339,19 +368,20 @@ impl<S: Read> Decoder<S> {
         let mut i = 0;
         let mut escaped = false;
         loop {
-            while i >= self.buffer.len() && !self.source.is_terminated() {
+            while i >= self.remaining() && !self.source.is_terminated() {
                 self.buffer().await?;
             }
 
-            if i < self.buffer.len() && &self.buffer[i..i + 1] == QUOTE && !escaped {
-                break;
-            } else if self.source.is_terminated() {
-                return Err(Error::unexpected_end());
+            match self.available().get(i) {
+                Some(b) if std::slice::from_ref(b) == QUOTE && !escaped => break,
+                Some(_) => {}
+                None if self.source.is_terminated() => return Err(Error::unexpected_end()),
+                None => continue,
             }
 
             if escaped {
                 escaped = false;
-            } else if self.buffer[i] == ESCAPE[0] {
+            } else if self.available()[i] == ESCAPE[0] {
                 escaped = true;
             }
 
@@ -360,36 +390,34 @@ impl<S: Read> Decoder<S> {
 
         let mut s = Vec::with_capacity(i);
         let mut escape = false;
-        for byte in self.buffer.drain(0..i) {
-            let as_slice = std::slice::from_ref(&byte);
+        for byte in &self.available()[..i] {
+            let as_slice = std::slice::from_ref(byte);
             if escape {
-                s.put_u8(byte);
+                s.push(*byte);
                 escape = false;
             } else if as_slice == ESCAPE {
                 escape = true;
             } else {
-                s.put_u8(byte);
+                s.push(*byte);
             }
         }
 
-        self.buffer.remove(0); // process the end quote
-        self.buffer.shrink_to_fit();
+        self.consume(i + 1); // include end quote
         Ok(s)
     }
 
     async fn buffer_while<F: Fn(u8) -> bool>(&mut self, cond: F) -> Result<usize, Error> {
         let mut i = 0;
         loop {
-            while i >= self.buffer.len() && !self.source.is_terminated() {
+            while i >= self.remaining() && !self.source.is_terminated() {
                 self.buffer().await?;
             }
 
-            if i < self.buffer.len() && cond(self.buffer[i]) {
-                i += 1;
-            } else if self.source.is_terminated() {
-                return Ok(i);
-            } else {
-                break;
+            match self.available().get(i) {
+                Some(b) if cond(*b) => i += 1,
+                Some(_) => break,
+                None if self.source.is_terminated() => return Ok(i),
+                None => continue,
             }
         }
 
@@ -397,25 +425,28 @@ impl<S: Read> Decoder<S> {
     }
 
     async fn peek(&mut self) -> Result<Option<u8>, Error> {
-        while self.buffer.is_empty() && !self.source.is_terminated() {
+        while self.remaining() == 0 && !self.source.is_terminated() {
             self.buffer().await?;
         }
 
-        if self.buffer.is_empty() {
+        if self.remaining() == 0 {
             Ok(None)
         } else {
-            Ok(Some(self.buffer[0]))
+            Ok(Some(self.available()[0]))
         }
     }
 
     async fn next_char(&mut self) -> Result<Option<u8>, Error> {
-        while self.buffer.is_empty() && !self.source.is_terminated() {
+        while self.remaining() == 0 && !self.source.is_terminated() {
             self.buffer().await?;
         }
 
-        match self.buffer.len() {
-            0 => Ok(None),
-            _ => Ok(Some(self.buffer.remove(0))),
+        if self.remaining() == 0 {
+            Ok(None)
+        } else {
+            let b = self.available()[0];
+            self.consume(1);
+            Ok(Some(b))
         }
     }
 
@@ -425,73 +456,79 @@ impl<S: Read> Decoder<S> {
     }
 
     async fn next_or_eof(&mut self) -> Result<u8, Error> {
-        while self.buffer.is_empty() && !self.source.is_terminated() {
+        while self.remaining() == 0 && !self.source.is_terminated() {
             self.buffer().await?;
         }
-        if self.buffer.is_empty() {
+        if self.remaining() == 0 {
             Err(Error::unexpected_end())
         } else {
-            Ok(self.buffer.remove(0))
+            let b = self.available()[0];
+            self.consume(1);
+            Ok(b)
         }
     }
 
     async fn decode_number<V: Visitor>(&mut self, visitor: V) -> Result<V::Value, Error> {
         let mut i = 0;
         loop {
-            if self.buffer[i] == DECIMAL[0] || self.buffer[i] == E[0] {
+            while i >= self.remaining() && !self.source.is_terminated() {
+                self.buffer().await?;
+            }
+
+            if i >= self.remaining() {
+                return de::Decoder::decode_i64(self, visitor).await;
+            }
+
+            let b = self.available()[i];
+            if b == DECIMAL[0] || b == E[0] || b == b'E' {
                 return de::Decoder::decode_f64(self, visitor).await;
-            } else if !self.numeric.contains(&self.buffer[i]) {
+            } else if !is_numeric_byte(b) {
                 return de::Decoder::decode_i64(self, visitor).await;
             }
 
             i += 1;
-            while i >= self.buffer.len() && !self.source.is_terminated() {
-                self.buffer().await?;
-            }
-
-            if self.source.is_terminated() {
-                return de::Decoder::decode_i64(self, visitor).await;
-            }
         }
     }
 
     async fn expect_delimiter(&mut self, delimiter: &'static [u8]) -> Result<(), Error> {
-        while self.buffer.is_empty() && !self.source.is_terminated() {
+        while self.remaining() == 0 && !self.source.is_terminated() {
             self.buffer().await?;
         }
 
-        if self.buffer.is_empty() {
+        if self.remaining() == 0 {
             return Err(Error::unexpected_end());
         }
 
-        if &self.buffer[0..1] == delimiter {
-            self.buffer.remove(0);
+        if self.available().starts_with(delimiter) {
+            self.consume(delimiter.len());
             Ok(())
         } else {
             let contents = self.contents(SNIPPET_LEN)?;
             Err(de::Error::custom(format!(
                 "unexpected delimiter {}, expected {} at `{}`...",
-                self.buffer[0] as char, delimiter[0] as char, contents
+                self.available()[0] as char,
+                delimiter[0] as char,
+                contents
             )))
         }
     }
 
     async fn expect_whitespace(&mut self) -> Result<(), Error> {
         let i = self.buffer_while(|b| (b as char).is_whitespace()).await?;
-        self.buffer.drain(..i);
+        self.consume(i);
         Ok(())
     }
 
     async fn ignore_value(&mut self) -> Result<(), Error> {
         self.expect_whitespace().await?;
 
-        while self.buffer.is_empty() && !self.source.is_terminated() {
+        while self.remaining() == 0 && !self.source.is_terminated() {
             self.buffer().await?;
         }
 
-        if !self.buffer.is_empty() {
+        if self.remaining() != 0 {
             // Determine the type of JSON value based on the first character in the buffer
-            match self.buffer[0] {
+            match self.available()[0] {
                 b'"' => self.ignore_string().await?,
                 b'-' => {
                     self.eat_char().await?;
@@ -507,7 +544,7 @@ impl<S: Read> Decoder<S> {
                 _ => {
                     return Err(Error::invalid_utf8(format!(
                         "unexpected token ignoring value: {}",
-                        self.buffer[0]
+                        self.available()[0]
                     )))
                 }
             }
@@ -520,11 +557,11 @@ impl<S: Read> Decoder<S> {
         // eat the first char, which is a quote
         self.eat_char().await?;
         loop {
-            if self.buffer.is_empty() {
+            if self.remaining() == 0 {
                 self.buffer().await?;
             }
 
-            if self.buffer.is_empty() && self.source.is_terminated() {
+            if self.remaining() == 0 && self.source.is_terminated() {
                 return Err(Error::unexpected_end());
             }
 
@@ -588,14 +625,14 @@ impl<S: Read> Decoder<S> {
     }
 
     async fn maybe_delimiter(&mut self, delimiter: &'static [u8]) -> Result<bool, Error> {
-        while self.buffer.is_empty() && !self.source.is_terminated() {
+        while self.remaining() == 0 && !self.source.is_terminated() {
             self.buffer().await?;
         }
 
-        if self.buffer.is_empty() {
+        if self.remaining() == 0 {
             Ok(false)
-        } else if self.buffer.starts_with(delimiter) {
-            self.buffer.remove(0);
+        } else if self.available().starts_with(delimiter) {
+            self.consume(delimiter.len());
             Ok(true)
         } else {
             Ok(false)
@@ -605,30 +642,31 @@ impl<S: Read> Decoder<S> {
     async fn parse_bool(&mut self) -> Result<bool, Error> {
         self.expect_whitespace().await?;
 
-        while self.buffer.len() < TRUE.len() && !self.source.is_terminated() {
+        while self.remaining() < TRUE.len() && !self.source.is_terminated() {
             self.buffer().await?;
         }
 
-        if self.buffer.is_empty() {
+        if self.remaining() == 0 {
             return Err(Error::unexpected_end());
-        } else if self.buffer.starts_with(TRUE) {
-            self.buffer.drain(0..TRUE.len());
+        } else if self.available().starts_with(TRUE) {
+            self.consume(TRUE.len());
             return Ok(true);
         }
 
-        while self.buffer.len() < FALSE.len() && !self.source.is_terminated() {
+        while self.remaining() < FALSE.len() && !self.source.is_terminated() {
             self.buffer().await?;
         }
 
-        if self.buffer.is_empty() {
+        if self.remaining() == 0 {
             return Err(Error::unexpected_end());
-        } else if self.buffer.starts_with(FALSE) {
-            self.buffer.drain(0..FALSE.len());
+        } else if self.available().starts_with(FALSE) {
+            self.consume(FALSE.len());
             return Ok(false);
         }
 
-        let i = Ord::min(self.buffer.len(), SNIPPET_LEN);
-        let unknown = String::from_utf8(self.buffer[..i].to_vec()).map_err(Error::invalid_utf8)?;
+        let buf = self.available();
+        let i = Ord::min(buf.len(), SNIPPET_LEN);
+        let unknown = String::from_utf8(buf[..i].to_vec()).map_err(Error::invalid_utf8)?;
         Err(de::Error::invalid_value(unknown, "a boolean"))
     }
 
@@ -638,13 +676,13 @@ impl<S: Read> Decoder<S> {
     {
         self.expect_whitespace().await?;
 
-        let numeric = self.numeric.clone();
-        let i = self.buffer_while(|b| numeric.contains(&b)).await?;
-        let n = String::from_utf8(self.buffer[0..i].to_vec()).map_err(Error::invalid_utf8)?;
+        let i = self.buffer_while(is_numeric_byte).await?;
+        let buf = self.available();
+        let n = std::str::from_utf8(&buf[0..i]).map_err(Error::invalid_utf8)?;
 
         match n.parse() {
             Ok(number) => {
-                self.buffer.drain(..i);
+                self.consume(i);
                 Ok(number)
             }
             Err(cause) => Err(de::Error::invalid_value(cause, std::any::type_name::<N>())),
@@ -659,17 +697,18 @@ impl<S: Read> Decoder<S> {
     async fn parse_unit(&mut self) -> Result<(), Error> {
         self.expect_whitespace().await?;
 
-        while self.buffer.len() < NULL.len() && !self.source.is_terminated() {
+        while self.remaining() < NULL.len() && !self.source.is_terminated() {
             self.buffer().await?;
         }
 
-        if self.buffer.starts_with(NULL) {
-            self.buffer.drain(..NULL.len());
+        if self.available().starts_with(NULL) {
+            self.consume(NULL.len());
             Ok(())
         } else {
-            let i = Ord::min(self.buffer.len(), SNIPPET_LEN);
+            let buf = self.available();
+            let i = Ord::min(buf.len(), SNIPPET_LEN);
             let as_str =
-                String::from_utf8(self.buffer[..i].to_vec()).map_err(Error::invalid_utf8)?;
+                String::from_utf8(buf[..i].to_vec()).map_err(Error::invalid_utf8)?;
 
             Err(de::Error::invalid_type(as_str, "null"))
         }
@@ -831,49 +870,50 @@ impl<S: Read> de::Decoder for Decoder<S> {
     async fn decode_any<V: Visitor>(&mut self, visitor: V) -> Result<V::Value, Self::Error> {
         self.expect_whitespace().await?;
 
-        while self.buffer.is_empty() && !self.source.is_terminated() {
+        while self.remaining() == 0 && !self.source.is_terminated() {
             self.buffer().await?;
         }
 
-        if self.buffer.is_empty() {
+        if self.remaining() == 0 {
             Err(Error::unexpected_end())
-        } else if self.buffer.starts_with(QUOTE) {
+        } else if self.available().starts_with(QUOTE) {
             self.decode_string(visitor).await
-        } else if self.buffer.starts_with(LIST_BEGIN) {
+        } else if self.available().starts_with(LIST_BEGIN) {
             self.decode_seq(visitor).await
-        } else if self.buffer.starts_with(MAP_BEGIN) {
+        } else if self.available().starts_with(MAP_BEGIN) {
             self.decode_map(visitor).await
-        } else if self.numeric.contains(&self.buffer[0]) {
+        } else if is_number_start(self.available()[0]) {
             self.decode_number(visitor).await
-        } else if (self.buffer.len() >= FALSE.len() && self.buffer.starts_with(FALSE))
-            || (self.buffer.len() >= TRUE.len() && self.buffer.starts_with(TRUE))
+        } else if (self.remaining() >= FALSE.len() && self.available().starts_with(FALSE))
+            || (self.remaining() >= TRUE.len() && self.available().starts_with(TRUE))
         {
             self.decode_bool(visitor).await
-        } else if self.buffer.len() >= NULL.len() && self.buffer.starts_with(NULL) {
+        } else if self.remaining() >= NULL.len() && self.available().starts_with(NULL) {
             self.decode_option(visitor).await
         } else {
-            while self.buffer.len() < TRUE.len() && !self.source.is_terminated() {
+            while self.remaining() < TRUE.len() && !self.source.is_terminated() {
                 self.buffer().await?;
             }
 
-            if self.buffer.is_empty() {
+            if self.remaining() == 0 {
                 Err(Error::unexpected_end())
-            } else if self.buffer.starts_with(TRUE) {
+            } else if self.available().starts_with(TRUE) {
                 self.decode_bool(visitor).await
-            } else if self.buffer.starts_with(NULL) {
+            } else if self.available().starts_with(NULL) {
                 self.decode_option(visitor).await
             } else {
-                while self.buffer.len() < FALSE.len() && !self.source.is_terminated() {
+                while self.remaining() < FALSE.len() && !self.source.is_terminated() {
                     self.buffer().await?;
                 }
 
-                if self.buffer.is_empty() {
+                if self.remaining() == 0 {
                     Err(Error::unexpected_end())
-                } else if self.buffer.starts_with(FALSE) {
+                } else if self.available().starts_with(FALSE) {
                     self.decode_bool(visitor).await
                 } else {
-                    let i = Ord::min(self.buffer.len(), SNIPPET_LEN);
-                    let s = String::from_utf8(self.buffer[0..i].to_vec())
+                    let buf = self.available();
+                    let i = Ord::min(buf.len(), SNIPPET_LEN);
+                    let s = String::from_utf8(buf[0..i].to_vec())
                         .map_err(Error::invalid_utf8)?;
 
                     Err(de::Error::invalid_value(
@@ -1040,12 +1080,12 @@ impl<S: Read> de::Decoder for Decoder<S> {
     async fn decode_option<V: Visitor>(&mut self, visitor: V) -> Result<V::Value, Self::Error> {
         self.expect_whitespace().await?;
 
-        while self.buffer.len() < NULL.len() && !self.source.is_terminated() {
+        while self.remaining() < NULL.len() && !self.source.is_terminated() {
             self.buffer().await?;
         }
 
-        if self.buffer.starts_with(NULL) {
-            self.buffer.drain(0..NULL.len());
+        if self.available().starts_with(NULL) {
+            self.consume(NULL.len());
             visitor.visit_none()
         } else {
             visitor.visit_some(self).await
@@ -1101,7 +1141,7 @@ impl<S: Read> From<S> for Decoder<S> {
         Self {
             source,
             buffer: vec![],
-            numeric: NUMERIC.iter().cloned().collect(),
+            offset: 0,
         }
     }
 }
@@ -1171,6 +1211,16 @@ fn decode_hex_val(val: u8) -> Option<u16> {
     }
 }
 
+#[inline]
+fn is_numeric_byte(b: u8) -> bool {
+    matches!(b, b'0'..=b'9' | b'-' | b'e' | b'E' | b'.')
+}
+
+#[inline]
+fn is_number_start(b: u8) -> bool {
+    b == b'-' || (b'0'..=b'9').contains(&b)
+}
+
 #[cfg(test)]
 mod tests {
     use std::cmp::max;
@@ -1225,7 +1275,7 @@ mod tests {
         let res = decoder.ignore_exactly(to_ignore).await;
 
         assert_eq!(res.is_ok(), success);
-        assert_eq!(decoder.buffer.len(), chars_left);
+        assert_eq!(decoder.remaining(), chars_left);
     }
 
     #[test_case(r#""""#, Ok(0); "empty string")]
@@ -1255,7 +1305,7 @@ mod tests {
         let res = decoder.ignore_string().await;
 
         match expected {
-            Ok(end_length) => assert_eq!(decoder.buffer.len(), end_length),
+            Ok(end_length) => assert_eq!(decoder.remaining(), end_length),
             Err(e) => assert_eq!(Err(e), res),
         }
     }
@@ -1273,7 +1323,7 @@ mod tests {
 
         if let Ok(end_length) = expected {
             res.unwrap();
-            assert_eq!(decoder.buffer.len(), end_length);
+            assert_eq!(decoder.remaining(), end_length);
         } else {
             assert_eq!(res.unwrap_err(), expected.unwrap_err())
         }
@@ -1300,7 +1350,7 @@ mod tests {
 
         if let Ok(end_length) = expected {
             res.unwrap();
-            assert_eq!(decoder.buffer.len(), end_length);
+            assert_eq!(decoder.remaining(), end_length);
         } else {
             assert_eq!(res.unwrap_err(), expected.unwrap_err())
         }
@@ -1321,7 +1371,7 @@ mod tests {
         let res = decoder.ignore_array().await;
 
         match expected {
-            Ok(end_length) => assert_eq!(decoder.buffer.len(), end_length),
+            Ok(end_length) => assert_eq!(decoder.remaining(), end_length),
             Err(e) => assert_eq!(res.unwrap_err(), e),
         }
     }
@@ -1345,7 +1395,7 @@ mod tests {
 
         match expected {
             Err(e) => assert_eq!(Err(e), res),
-            Ok(end_length) => assert_eq!(decoder.buffer.len(), end_length),
+            Ok(end_length) => assert_eq!(decoder.remaining(), end_length),
         }
     }
 }
