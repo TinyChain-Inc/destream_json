@@ -439,7 +439,7 @@ impl<'en> en::Encoder<'en> for Encoder {
 
     #[inline]
     fn encode_str(self, v: &str) -> Result<Self::Ok, Self::Error> {
-        let mut chunk = BytesMut::with_capacity(v.as_bytes().len() + 2);
+        let mut chunk = BytesMut::with_capacity(v.len() + 2);
         chunk.extend_from_slice(QUOTE);
         chunk.extend(escape(v));
         chunk.extend_from_slice(QUOTE);

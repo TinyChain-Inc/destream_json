@@ -6,19 +6,14 @@ use destream::en::{Encoder, IntoStream, ToStream};
 use futures::FutureExt;
 use number_general::Number;
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Default, Eq, PartialEq)]
 pub enum Value {
     List(Vec<Value>),
     Map(HashMap<String, Value>),
+    #[default]
     None,
     Number(Number),
     String(String),
-}
-
-impl Default for Value {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 impl FromIterator<Value> for Value {
