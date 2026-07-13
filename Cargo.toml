@@ -21,16 +21,16 @@ all = ["tokio-io", "value"]
 async-recursion = "1.1"
 base64 = "0.22"
 bytes = "1.7"
-destream = "0.10.1"
+destream = { path = "../destream", version = "0.10.1" }
 futures = "0.3"
-number-general = { version = "0.14.0", optional = true }
+number-general = { path = "../number-general", version = "0.14.0", optional = true }
 pin-project = "1.1"
 tokio = { version = "1.35", features = ["io-util"], optional = true }
 trait-variant = "0.1.2"
 uuid = "1.10"
 
 [dev-dependencies]
-number-general = { version = "0.14.0", features=["stream"] }
+number-general = { path = "../number-general", version = "0.14.0", features=["stream"] }
 tokio = { version = "1.39", features = ["fs", "macros"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tokio-test = "0.4"
