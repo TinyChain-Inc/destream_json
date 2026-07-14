@@ -69,7 +69,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        rust: [beta, 1.76.0]
+        rust: [beta, 1.85.0]
         os: [ubuntu]
         include:
           - rust: stable
@@ -114,7 +114,7 @@ jobs:
               )
             done < <(find "$dir" -name Cargo.toml -type f)
           done
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{matrix.rust}}
           targets: ${{matrix.target}}

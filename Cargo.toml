@@ -3,6 +3,7 @@ name = "destream_json"
 version = "0.15.0"
 authors = ["code@tinychain.net"]
 edition = "2021"
+rust-version = "1.85"
 license = "Apache-2.0"
 description = "Library for decoding & encoding a JSON stream"
 repository = "https://github.com/TinyChain-Inc/destream_json"
@@ -21,9 +22,9 @@ all = ["tokio-io", "value"]
 async-recursion = "1.1"
 base64 = "0.22"
 bytes = "1.7"
-destream = { path = "../destream", version = "0.10.1" }
+destream = { path = "../destream", version = "0.10" }
 futures = "0.3"
-number-general = { path = "../number-general", version = "0.14.0", optional = true }
+number-general = { path = "../number-general", version = "0.14", optional = true }
 pin-project = "1.1"
 tokio = { version = "1.35", features = ["io-util"], optional = true }
 trait-variant = "0.1.2"
