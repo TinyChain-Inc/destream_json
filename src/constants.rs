@@ -10,9 +10,7 @@ pub const LIST_END: &[u8] = b"]";
 pub const NULL: &[u8] = b"null";
 pub const MAP_BEGIN: &[u8] = b"{";
 pub const MAP_END: &[u8] = b"}";
-pub const NUMERIC: [u8; 15] = [
-    b'0', b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9', b'0', b'-', b'e', b'E', b'.',
-];
+pub const NUMERIC: [u8; 15] = *b"01234567890-eE.";
 pub const QUOTE: &[u8] = b"\"";
 
 // Lookup table of bytes that must be escaped. A value of true at
