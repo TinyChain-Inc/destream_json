@@ -13,36 +13,6 @@ pub const MAP_END: &[u8] = b"}";
 pub const NUMERIC: [u8; 15] = *b"01234567890-eE.";
 pub const QUOTE: &[u8] = b"\"";
 
-// Lookup table of bytes that must be escaped. A value of true at
-// index i means that byte i requires an escape sequence in the input.
-// taken from
-// https://github.com/serde-rs/json/blob/4a0be88b5ac6cda971a52df9f027b551fe566347/src/read.rs#L789
-pub static ESCAPE_CHARS: [bool; 256] = {
-    const CT: bool = true; // control character \x00..=\x1F
-    const QU: bool = true; // quote \x22
-    const BS: bool = true; // backslash \x5C
-    const __: bool = false; // allow unescaped
-    [
-        //   1   2   3   4   5   6   7   8   9   A   B   C   D   E   F
-        CT, CT, CT, CT, CT, CT, CT, CT, CT, CT, CT, CT, CT, CT, CT, CT, // 0
-        CT, CT, CT, CT, CT, CT, CT, CT, CT, CT, CT, CT, CT, CT, CT, CT, // 1
-        __, __, QU, __, __, __, __, __, __, __, __, __, __, __, __, __, // 2
-        __, __, __, __, __, __, __, __, __, __, __, __, __, __, __, __, // 3
-        __, __, __, __, __, __, __, __, __, __, __, __, __, __, __, __, // 4
-        __, __, __, __, __, __, __, __, __, __, __, __, BS, __, __, __, // 5
-        __, __, __, __, __, __, __, __, __, __, __, __, __, __, __, __, // 6
-        __, __, __, __, __, __, __, __, __, __, __, __, __, __, __, __, // 7
-        __, __, __, __, __, __, __, __, __, __, __, __, __, __, __, __, // 8
-        __, __, __, __, __, __, __, __, __, __, __, __, __, __, __, __, // 9
-        __, __, __, __, __, __, __, __, __, __, __, __, __, __, __, __, // A
-        __, __, __, __, __, __, __, __, __, __, __, __, __, __, __, __, // B
-        __, __, __, __, __, __, __, __, __, __, __, __, __, __, __, __, // C
-        __, __, __, __, __, __, __, __, __, __, __, __, __, __, __, __, // D
-        __, __, __, __, __, __, __, __, __, __, __, __, __, __, __, __, // E
-        __, __, __, __, __, __, __, __, __, __, __, __, __, __, __, __, // F
-    ]
-};
-
 pub static HEX: [u8; 256] = {
     const __: u8 = 255; // not a hex digit
     [

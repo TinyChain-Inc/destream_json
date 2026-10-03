@@ -10,6 +10,10 @@
 //! assert_eq!(expected, actual);
 //! ```
 //!
+//! Decoding and inspection enforce a maximum nesting depth of 1,024 containers.
+//! `destream::de::Decoder::inspect_any` consumes bounded structural observations
+//! without constructing decoded payloads. Top-level decoding rejects trailing input.
+//!
 //! Deviations from the [JSON spec](https://www.json.org/):
 //!  - `destream_json` will not error out if asked to decode or encode a non-string key in a JSON
 //!    object (i.e., it supports a superset of the official JSON spec). This may cause issues
@@ -20,7 +24,7 @@ pub use de::{decode, try_decode};
 pub use en::{encode, encode_map, encode_seq};
 
 #[cfg(feature = "value")]
-pub use value::Value;
+pub use value::{Value, ValueKind};
 
 #[cfg(feature = "tokio-io")]
 pub use de::read_from;
@@ -318,29 +322,35 @@ mod tests {
     #[cfg(feature = "value")]
     #[tokio::test]
     async fn test_generic_value() {
-        use crate::Value;
+        use crate::{Value, ValueKind};
         use std::iter;
 
-        let expected = Value::List(vec![
-            Value::List(vec![
-                Value::String("baz".to_string()),
-                Value::Map(HashMap::from_iter(iter::once((
+        let expected: Value = ValueKind::List(vec![
+            ValueKind::List(vec![
+                ValueKind::String("baz".to_string()).into(),
+                ValueKind::Map(HashMap::from_iter(iter::once((
                     "spam".to_string(),
-                    Value::Map(HashMap::new()),
-                )))),
-                Value::Number(100u64.into()),
-            ]),
-            Value::List(vec![
-                Value::String("foo".to_string()),
-                Value::Map(HashMap::from_iter(iter::once((
+                    ValueKind::Map(HashMap::new()).into(),
+                ))))
+                .into(),
+                ValueKind::Number(100u64.into()).into(),
+            ])
+            .into(),
+            ValueKind::List(vec![
+                ValueKind::String("foo".to_string()).into(),
+                ValueKind::Map(HashMap::from_iter(iter::once((
                     "bar".to_string(),
-                    Value::List(vec![
-                        Value::Number(true.into()),
-                        Value::Number(false.into()),
-                    ]),
-                )))),
-            ]),
-        ]);
+                    ValueKind::List(vec![
+                        ValueKind::Number(true.into()).into(),
+                        ValueKind::Number(false.into()).into(),
+                    ])
+                    .into(),
+                ))))
+                .into(),
+            ])
+            .into(),
+        ])
+        .into();
 
         test_decode(
             "[[\"baz\", {\"spam\": {}}, 100], [\"foo\", {\"bar\": [true, false]}]]",
@@ -431,14 +441,19 @@ mod tests {
 
         impl FromStream for IgnoredValue {
             type Context = ();
+
             async fn from_stream<D: de::Decoder>(_: (), decoder: &mut D) -> Result<Self, D::Error> {
                 use destream::Visitor;
+
                 struct IgnoredVisitor;
+
                 impl Visitor for IgnoredVisitor {
                     type Value = IgnoredValue;
+
                     fn expecting() -> &'static str {
                         "any json to be ignored"
                     }
+
                     fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
                         Ok(Self::Value::None)
                     }
@@ -679,5 +694,41 @@ mod tests {
         let file = tokio::fs::File::open(path).await.unwrap();
         let actual = read_from((), file).await.unwrap();
         assert_eq!(value, actual);
+    }
+}
+
+#[cfg(test)]
+mod width_tests {
+    use futures::{stream, TryStreamExt};
+
+    #[tokio::test]
+    async fn ordinary_wide_containers_use_flat_streams() {
+        let values = vec![7u64; 32_768];
+        let bytes = crate::encode(&values)
+            .unwrap()
+            .try_fold(Vec::new(), |mut bytes, chunk| async move {
+                bytes.extend_from_slice(&chunk);
+                Ok(bytes)
+            })
+            .await
+            .unwrap();
+        let actual: Vec<u64> = crate::decode((), stream::iter([bytes.into()]))
+            .await
+            .unwrap();
+        assert_eq!(actual, values);
+        let values: std::collections::BTreeMap<_, _> = (0..16_384u64).map(|i| (i, i)).collect();
+        let bytes = crate::encode(&values)
+            .unwrap()
+            .try_fold(Vec::new(), |mut bytes, chunk| async move {
+                bytes.extend_from_slice(&chunk);
+                Ok(bytes)
+            })
+            .await
+            .unwrap();
+        let actual: std::collections::BTreeMap<u64, u64> =
+            crate::decode((), stream::iter([bytes.into()]))
+                .await
+                .unwrap();
+        assert_eq!(actual, values);
     }
 }

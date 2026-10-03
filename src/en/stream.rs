@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::task::{self, Poll};
 
@@ -26,10 +27,14 @@ impl<'en> JSONMapEntryStream<'en> {
         let key = key.into_stream(Encoder)?;
         let value = value.into_stream(Encoder)?;
 
-        Ok(Self {
+        Ok(Self::from_streams(key, value))
+    }
+
+    fn from_streams(key: JSONStream<'en>, value: JSONStream<'en>) -> Self {
+        Self {
             key: key.fuse(),
             value: value.fuse(),
-        })
+        }
     }
 }
 
@@ -159,4 +164,34 @@ pub fn encode_map<
         start: MAP_BEGIN,
         end: MAP_END,
     }
+}
+
+pub(super) fn encode_list_encoded<'en>(items: VecDeque<JSONStream<'en>>) -> JSONStream<'en> {
+    let source = futures::stream::iter(items.into_iter().map(Ok));
+    Box::pin(JSONEncodingStream {
+        source: source.fuse(),
+        next: None,
+        started: false,
+        finished: false,
+        start: LIST_BEGIN,
+        end: LIST_END,
+    })
+}
+
+pub(super) fn encode_map_encoded<'en>(
+    entries: VecDeque<(JSONStream<'en>, JSONStream<'en>)>,
+) -> JSONStream<'en> {
+    let source = futures::stream::iter(
+        entries
+            .into_iter()
+            .map(|(key, value)| Ok(JSONMapEntryStream::from_streams(key, value))),
+    );
+    Box::pin(JSONEncodingStream {
+        source: source.fuse(),
+        next: None,
+        started: false,
+        finished: false,
+        start: MAP_BEGIN,
+        end: MAP_END,
+    })
 }

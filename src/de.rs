@@ -4,7 +4,6 @@ use std::collections::HashSet;
 use std::fmt;
 use std::str::FromStr;
 
-use async_recursion::async_recursion;
 use bytes::{BufMut, Bytes};
 use destream::{de, FromStream, Visitor};
 use futures::{
@@ -18,6 +17,21 @@ use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
 use crate::constants::*;
 
 const SNIPPET_LEN: usize = 50;
+const CHUNK_SIZE: usize = 4096;
+const MAX_DEPTH: usize = 1024;
+
+fn container_observation(container: &de::Container) -> de::Inspection<'static> {
+    if container.kind() == de::Kind::Map {
+        de::Inspection::Map {
+            len: container.len(),
+        }
+    } else {
+        de::Inspection::Sequence {
+            len: container.len(),
+            size_hint: container.size_hint(),
+        }
+    }
+}
 
 /// Methods common to any decodable [`Stream`]
 #[trait_variant::make(Send)]
@@ -130,27 +144,13 @@ impl fmt::Display for Error {
 
 struct MapAccess<'a, S> {
     decoder: &'a mut Decoder<S>,
-    size_hint: Option<usize>,
-    done: bool,
+    container: de::Container,
 }
 
 impl<'a, S: Read + 'a> MapAccess<'a, S> {
-    async fn new(
-        decoder: &'a mut Decoder<S>,
-        size_hint: Option<usize>,
-    ) -> Result<MapAccess<'a, S>, Error> {
-        decoder.expect_whitespace().await?;
-
-        decoder.expect_delimiter(MAP_BEGIN).await?;
-        decoder.expect_whitespace().await?;
-
-        let done = decoder.maybe_delimiter(MAP_END).await?;
-
-        Ok(MapAccess {
-            decoder,
-            size_hint,
-            done,
-        })
+    async fn new(decoder: &'a mut Decoder<S>, size_hint: Option<usize>) -> Result<Self, Error> {
+        let container = de::Decoder::open_container(decoder, de::Kind::Map, size_hint).await?;
+        Ok(Self { decoder, container })
     }
 }
 
@@ -158,67 +158,38 @@ impl<'a, S: Read + 'a> de::MapAccess for MapAccess<'a, S> {
     type Error = Error;
 
     async fn next_key<K: FromStream>(&mut self, context: K::Context) -> Result<Option<K>, Error> {
-        if self.done {
+        if self.container.slot() == de::Slot::End {
             return Ok(None);
         }
-
         self.decoder.expect_whitespace().await?;
         let key = K::from_stream(context, self.decoder).await?;
-
-        self.decoder.expect_whitespace().await?;
-        self.decoder.expect_delimiter(COLON).await?;
-        self.decoder.expect_whitespace().await?;
-
+        de::Decoder::finish_child(self.decoder, &mut self.container).await?;
         Ok(Some(key))
     }
 
     async fn next_value<V: FromStream>(&mut self, context: V::Context) -> Result<V, Error> {
-        if self.done {
-            return Err(de::Error::custom(
-                "called MapAccess::next_value but the map has already ended",
-            ));
+        if self.container.slot() != de::Slot::Value {
+            return Err(de::Error::custom("expected a map value after its key"));
         }
-
         let value = V::from_stream(context, self.decoder).await?;
-
-        self.decoder.expect_whitespace().await?;
-
-        if self.decoder.maybe_delimiter(MAP_END).await? {
-            self.done = true;
-        } else {
-            self.decoder.expect_delimiter(COMMA).await?;
-        }
-
+        de::Decoder::finish_child(self.decoder, &mut self.container).await?;
         Ok(value)
     }
 
     fn size_hint(&self) -> Option<usize> {
-        self.size_hint
+        self.container.size_hint()
     }
 }
 
 struct SeqAccess<'a, S> {
     decoder: &'a mut Decoder<S>,
-    size_hint: Option<usize>,
-    done: bool,
+    container: de::Container,
 }
 
 impl<'a, S: Read + 'a> SeqAccess<'a, S> {
-    async fn new(
-        decoder: &'a mut Decoder<S>,
-        size_hint: Option<usize>,
-    ) -> Result<SeqAccess<'a, S>, Error> {
-        decoder.expect_whitespace().await?;
-        decoder.expect_delimiter(LIST_BEGIN).await?;
-        decoder.expect_whitespace().await?;
-
-        let done = decoder.maybe_delimiter(LIST_END).await?;
-
-        Ok(SeqAccess {
-            decoder,
-            size_hint,
-            done,
-        })
+    async fn new(decoder: &'a mut Decoder<S>, size_hint: Option<usize>) -> Result<Self, Error> {
+        let container = de::Decoder::open_container(decoder, de::Kind::Seq, size_hint).await?;
+        Ok(Self { decoder, container })
     }
 }
 
@@ -229,25 +200,17 @@ impl<'a, S: Read + 'a> de::SeqAccess for SeqAccess<'a, S> {
         &mut self,
         context: T::Context,
     ) -> Result<Option<T>, Self::Error> {
-        if self.done {
+        if self.container.slot() == de::Slot::End {
             return Ok(None);
         }
-
         self.decoder.expect_whitespace().await?;
         let value = T::from_stream(context, self.decoder).await?;
-        self.decoder.expect_whitespace().await?;
-
-        if self.decoder.maybe_delimiter(LIST_END).await? {
-            self.done = true;
-        } else {
-            self.decoder.expect_delimiter(COMMA).await?;
-        }
-
+        de::Decoder::finish_child(self.decoder, &mut self.container).await?;
         Ok(Some(value))
     }
 
     fn size_hint(&self) -> Option<usize> {
-        self.size_hint
+        self.container.size_hint()
     }
 }
 
@@ -281,8 +244,10 @@ impl<'a, S: Read + 'a, T: FromStream<Context = ()> + 'a> de::ArrayAccess<T> for 
 /// A structure that decodes Rust values from a JSON stream.
 pub struct Decoder<S> {
     source: S,
+    pending: Bytes,
     buffer: Vec<u8>,
     numeric: HashSet<u8>,
+    depth: usize,
 }
 
 #[cfg(feature = "tokio-io")]
@@ -294,12 +259,27 @@ where
         Decoder {
             source: SourceReader::from(reader),
             buffer: Vec::new(),
+            pending: Bytes::new(),
             numeric: NUMERIC.iter().cloned().collect(),
+            depth: 0,
         }
     }
 }
 
 impl<S> Decoder<S> {
+    fn push_depth(&mut self) -> Result<(), Error> {
+        if self.depth == MAX_DEPTH {
+            return Err(de::Error::custom("nesting depth limit exceeded (max 1024)"));
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    fn pop_depth(&mut self) {
+        debug_assert!(self.depth > 0);
+        self.depth -= 1;
+    }
+
     fn contents(&self, max_len: usize) -> Result<String, Error> {
         let len = Ord::min(self.buffer.len(), max_len);
         String::from_utf8(self.buffer[..len].to_vec()).map_err(Error::invalid_utf8)
@@ -315,22 +295,31 @@ where
         Decoder {
             source: SourceStream::from(stream),
             buffer: Vec::new(),
+            pending: Bytes::new(),
             numeric: NUMERIC.iter().cloned().collect(),
+            depth: 0,
         }
     }
 
     /// Return `true` if this [`Decoder`] has no more data to be decoded.
     pub fn is_terminated(&self) -> bool {
-        self.source.is_terminated()
+        self.source_terminated()
     }
 }
 
 impl<S: Read> Decoder<S> {
-    async fn buffer(&mut self) -> Result<(), Error> {
-        if let Some(data) = self.source.next().await {
-            self.buffer.extend(data?);
-        }
+    fn source_terminated(&self) -> bool {
+        self.pending.is_empty() && self.source.is_terminated()
+    }
 
+    async fn buffer(&mut self) -> Result<(), Error> {
+        if self.pending.is_empty() {
+            if let Some(data) = self.source.next().await {
+                self.pending = data?;
+            }
+        }
+        let len = self.pending.len().min(CHUNK_SIZE);
+        self.buffer.extend_from_slice(&self.pending.split_to(len));
         Ok(())
     }
 
@@ -340,13 +329,13 @@ impl<S: Read> Decoder<S> {
         let mut i = 0;
         let mut escaped = false;
         loop {
-            while i >= self.buffer.len() && !self.source.is_terminated() {
+            while i >= self.buffer.len() && !self.source_terminated() {
                 self.buffer().await?;
             }
 
             if i < self.buffer.len() && &self.buffer[i..i + 1] == QUOTE && !escaped {
                 break;
-            } else if self.source.is_terminated() {
+            } else if i >= self.buffer.len() && self.source_terminated() {
                 return Err(Error::unexpected_end());
             }
 
@@ -381,13 +370,13 @@ impl<S: Read> Decoder<S> {
     async fn buffer_while<F: Fn(u8) -> bool>(&mut self, cond: F) -> Result<usize, Error> {
         let mut i = 0;
         loop {
-            while i >= self.buffer.len() && !self.source.is_terminated() {
+            while i >= self.buffer.len() && !self.source_terminated() {
                 self.buffer().await?;
             }
 
             if i < self.buffer.len() && cond(self.buffer[i]) {
                 i += 1;
-            } else if self.source.is_terminated() {
+            } else if self.source_terminated() {
                 return Ok(i);
             } else {
                 break;
@@ -398,7 +387,7 @@ impl<S: Read> Decoder<S> {
     }
 
     async fn peek(&mut self) -> Result<Option<u8>, Error> {
-        while self.buffer.is_empty() && !self.source.is_terminated() {
+        while self.buffer.is_empty() && !self.source_terminated() {
             self.buffer().await?;
         }
 
@@ -410,7 +399,7 @@ impl<S: Read> Decoder<S> {
     }
 
     async fn next_char(&mut self) -> Result<Option<u8>, Error> {
-        while self.buffer.is_empty() && !self.source.is_terminated() {
+        while self.buffer.is_empty() && !self.source_terminated() {
             self.buffer().await?;
         }
 
@@ -425,17 +414,6 @@ impl<S: Read> Decoder<S> {
         Ok(())
     }
 
-    async fn next_or_eof(&mut self) -> Result<u8, Error> {
-        while self.buffer.is_empty() && !self.source.is_terminated() {
-            self.buffer().await?;
-        }
-        if self.buffer.is_empty() {
-            Err(Error::unexpected_end())
-        } else {
-            Ok(self.buffer.remove(0))
-        }
-    }
-
     async fn decode_number<V: Visitor>(&mut self, visitor: V) -> Result<V::Value, Error> {
         let mut i = 0;
         loop {
@@ -446,18 +424,18 @@ impl<S: Read> Decoder<S> {
             }
 
             i += 1;
-            while i >= self.buffer.len() && !self.source.is_terminated() {
+            while i >= self.buffer.len() && !self.source_terminated() {
                 self.buffer().await?;
             }
 
-            if self.source.is_terminated() {
+            if i >= self.buffer.len() && self.source_terminated() {
                 return de::Decoder::decode_i64(self, visitor).await;
             }
         }
     }
 
     async fn expect_delimiter(&mut self, delimiter: &'static [u8]) -> Result<(), Error> {
-        while self.buffer.is_empty() && !self.source.is_terminated() {
+        while self.buffer.is_empty() && !self.source_terminated() {
             self.buffer().await?;
         }
 
@@ -477,119 +455,160 @@ impl<S: Read> Decoder<S> {
         }
     }
 
-    async fn expect_whitespace(&mut self) -> Result<(), Error> {
-        let i = self.buffer_while(|b| (b as char).is_whitespace()).await?;
-        self.buffer.drain(..i);
-        Ok(())
-    }
-
-    async fn ignore_value(&mut self) -> Result<(), Error> {
+    async fn ensure_eof(&mut self) -> Result<(), Error> {
         self.expect_whitespace().await?;
-
-        while self.buffer.is_empty() && !self.source.is_terminated() {
-            self.buffer().await?;
+        if self.buffer.is_empty() {
+            Ok(())
+        } else {
+            Err(de::Error::custom(format!(
+                "expected end of stream, found `{}...`",
+                self.contents(SNIPPET_LEN)?
+            )))
         }
-
-        if !self.buffer.is_empty() {
-            // Determine the type of JSON value based on the first character in the buffer
-            match self.buffer[0] {
-                b'"' => self.ignore_string().await?,
-                b'-' => {
-                    self.eat_char().await?;
-                    self.ignore_number().await?;
-                }
-                b'0'..=b'9' => self.ignore_number().await?,
-                b't' => self.ignore_exactly("true").await?,
-                b'f' => self.ignore_exactly("false").await?,
-                b'n' => self.ignore_exactly("null").await?,
-                b'[' => self.ignore_array().await?,
-                b'{' => self.ignore_object().await?,
-                // If the first character doesn't match any JSON value type, return an error
-                _ => {
-                    return Err(Error::invalid_utf8(format!(
-                        "unexpected token ignoring value: {}",
-                        self.buffer[0]
-                    )))
-                }
-            }
-        }
-
-        Ok(())
     }
 
-    async fn ignore_string(&mut self) -> Result<(), Error> {
-        // eat the first char, which is a quote
-        self.eat_char().await?;
+    async fn expect_whitespace(&mut self) -> Result<(), Error> {
         loop {
-            if self.buffer.is_empty() {
+            while self.buffer.is_empty() && !self.source_terminated() {
                 self.buffer().await?;
             }
+            let count = self
+                .buffer
+                .iter()
+                .take_while(|byte| byte.is_ascii_whitespace())
+                .count();
+            let done = count < self.buffer.len() || self.source_terminated();
+            self.buffer.drain(..count);
+            if done {
+                return Ok(());
+            }
+        }
+    }
 
-            if self.buffer.is_empty() && self.source.is_terminated() {
+    async fn inspect_string<F>(&mut self, inspect: &mut F) -> Result<(), Error>
+    where
+        F: for<'a> FnMut(de::Inspection<'a>) -> Result<(), Error> + Send,
+    {
+        self.expect_delimiter(QUOTE).await?;
+        let mut output = [0; 4096];
+        let mut len = 0;
+        let mut capacity_bound = 0usize;
+        let mut escaped = false;
+        let mut hex_digits = 0;
+        loop {
+            while self.buffer.is_empty() && !self.source_terminated() {
+                self.buffer().await?;
+            }
+            if self.buffer.is_empty() {
                 return Err(Error::unexpected_end());
             }
-
-            let ch = self.next_or_eof().await?;
-            if !ESCAPE_CHARS[ch as usize] {
-                continue;
-            }
-
-            match ch {
-                b'"' => {
-                    return Ok(());
+            let mut consumed = 0;
+            let mut done = false;
+            for &byte in &self.buffer {
+                if len == output.len() {
+                    break;
                 }
-                b'\\' => {
-                    self.ignore_escaped_char().await?;
+                consumed += 1;
+                if !escaped && hex_digits == 0 && byte == b'"' {
+                    done = true;
+                    break;
                 }
-                ch => {
+                capacity_bound = capacity_bound
+                    .checked_add(1)
+                    .ok_or_else(|| de::Error::custom("string size overflow"))?;
+                if hex_digits != 0 {
+                    decode_hex_val(byte)
+                        .ok_or_else(|| Error::invalid_utf8("invalid escape decoding hex escape"))?;
+                    hex_digits -= 1;
+                } else if escaped {
+                    match byte {
+                        b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {}
+                        b'u' => hex_digits = 4,
+                        _ => return Err(Error::invalid_utf8("invalid escape character in string")),
+                    }
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                    continue;
+                } else if byte < 0x20 {
                     return Err(Error::invalid_utf8(format!(
-                        "invalid control character in string: {ch}"
+                        "invalid control character in string: {byte}"
                     )));
                 }
+                // Match the ordinary decoder: it removes the escape backslash,
+                // retaining the following bytes rather than expanding escapes.
+                output[len] = byte;
+                len += 1;
+            }
+            self.buffer.drain(..consumed);
+            if len == output.len() || done {
+                let valid = match std::str::from_utf8(&output[..len]) {
+                    Ok(_) => len,
+                    Err(error) if !done && error.error_len().is_none() => error.valid_up_to(),
+                    Err(error) => return Err(Error::invalid_utf8(error)),
+                };
+                if valid != 0 {
+                    inspect(de::Inspection::TextChunk(&output[..valid]))?;
+                    output.copy_within(valid..len, 0);
+                    len -= valid;
+                }
+            }
+            if done {
+                return inspect(de::Inspection::TextEnd { capacity_bound });
             }
         }
     }
 
-    /// Parses a JSON escape sequence and discards the value. Assumes the previous
-    /// byte read was a backslash.
-    async fn ignore_escaped_char(&mut self) -> Result<(), Error> {
-        let ch = self.next_or_eof().await?;
-
-        match ch {
-            b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {}
-            b'u' => {
-                // At this point we don't care if the codepoint is valid. We just
-                // want to consume it. We don't actually know what is valid or not
-                // at this point, because that depends on if this string will
-                // ultimately be parsed into a string or a byte buffer in the "real"
-                // parse.
-
-                self.decode_hex_escape().await?;
+    async fn inspect_value<F>(&mut self, inspect: &mut F) -> Result<(), Error>
+    where
+        F: for<'a> FnMut(de::Inspection<'a>) -> Result<(), Error> + Send,
+    {
+        let mut stack = Vec::new();
+        loop {
+            let kind = de::Decoder::peek_kind(self).await?;
+            if kind != de::Kind::Leaf {
+                let container = de::Decoder::open_container(self, kind, None).await?;
+                if container.slot() == de::Slot::End {
+                    inspect(container_observation(&container))?;
+                } else {
+                    stack.push(container);
+                    continue;
+                }
+            } else {
+                match self.peek().await?.ok_or_else(Error::unexpected_end)? {
+                    b'"' => self.inspect_string(inspect).await?,
+                    b'-' => {
+                        self.eat_char().await?;
+                        self.ignore_number().await?;
+                    }
+                    b'0'..=b'9' => self.ignore_number().await?,
+                    b't' => self.ignore_exactly("true").await?,
+                    b'f' => self.ignore_exactly("false").await?,
+                    b'n' => self.ignore_exactly("null").await?,
+                    byte => {
+                        return Err(Error::invalid_utf8(format!(
+                            "unexpected token ignoring value: {byte}"
+                        )))
+                    }
+                }
             }
-            _ => {
-                return Err(Error::invalid_utf8("invalid escape character in string"));
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn decode_hex_escape(&mut self) -> Result<u16, Error> {
-        let mut n = 0;
-        for _ in 0..4 {
-            let ch = decode_hex_val(self.next_or_eof().await?);
-            match ch {
-                None => return Err(Error::invalid_utf8("invalid escape decoding hex escape")),
-                Some(val) => {
-                    n = (n << 4) + val;
+            loop {
+                let Some(container) = stack.last_mut() else {
+                    return Ok(());
+                };
+                de::Decoder::finish_child(self, container).await?;
+                if container.slot() == de::Slot::End {
+                    inspect(container_observation(container))?;
+                    stack.pop();
+                } else {
+                    break;
                 }
             }
         }
-        Ok(n)
     }
 
     async fn maybe_delimiter(&mut self, delimiter: &'static [u8]) -> Result<bool, Error> {
-        while self.buffer.is_empty() && !self.source.is_terminated() {
+        while self.buffer.is_empty() && !self.source_terminated() {
             self.buffer().await?;
         }
 
@@ -606,7 +625,7 @@ impl<S: Read> Decoder<S> {
     async fn parse_bool(&mut self) -> Result<bool, Error> {
         self.expect_whitespace().await?;
 
-        while self.buffer.len() < TRUE.len() && !self.source.is_terminated() {
+        while self.buffer.len() < TRUE.len() && !self.source_terminated() {
             self.buffer().await?;
         }
 
@@ -617,7 +636,7 @@ impl<S: Read> Decoder<S> {
             return Ok(true);
         }
 
-        while self.buffer.len() < FALSE.len() && !self.source.is_terminated() {
+        while self.buffer.len() < FALSE.len() && !self.source_terminated() {
             self.buffer().await?;
         }
 
@@ -660,7 +679,7 @@ impl<S: Read> Decoder<S> {
     async fn parse_unit(&mut self) -> Result<(), Error> {
         self.expect_whitespace().await?;
 
-        while self.buffer.len() < NULL.len() && !self.source.is_terminated() {
+        while self.buffer.len() < NULL.len() && !self.source_terminated() {
             self.buffer().await?;
         }
 
@@ -764,75 +783,83 @@ impl<S: Read> Decoder<S> {
 
         Ok(())
     }
-
-    #[async_recursion]
-    async fn ignore_array(&mut self) -> Result<(), Error> {
-        self.eat_char().await?;
-        self.expect_whitespace().await?;
-        if self.peek().await? == Some(b']') {
-            self.eat_char().await?;
-            return Ok(());
-        }
-
-        loop {
-            self.ignore_value().await?;
-            self.expect_whitespace().await?;
-            match self.peek().await? {
-                Some(b',') => self.eat_char().await?,
-                Some(b']') => {
-                    self.eat_char().await?;
-                    return Ok(());
-                }
-                Some(ch) => {
-                    return Err(Error::invalid_utf8(format!(
-                        "invalid char {ch}, expected , or ]"
-                    )))
-                }
-                None => return Err(Error::unexpected_end()),
-            }
-        }
-    }
-
-    #[async_recursion]
-    async fn ignore_object(&mut self) -> Result<(), Error> {
-        self.eat_char().await?; // b'{'
-        self.expect_whitespace().await?;
-        if self.peek().await? == Some(b'}') {
-            self.eat_char().await?;
-            return Ok(());
-        }
-
-        loop {
-            self.expect_whitespace().await?;
-            self.ignore_string().await?; // key
-            self.expect_whitespace().await?;
-            self.ignore_exactly(":").await?;
-            self.ignore_value().await?;
-            self.expect_whitespace().await?;
-            match self.peek().await? {
-                Some(b'}') => {
-                    self.eat_char().await?;
-                    return Ok(());
-                }
-                Some(b',') => self.eat_char().await?,
-                Some(ch) => {
-                    return Err(Error::invalid_utf8(format!(
-                        "invalid char {ch}, expected , or }}"
-                    )))
-                }
-                None => return Err(Error::unexpected_end()),
-            }
-        }
-    }
 }
 
 impl<S: Read> de::Decoder for Decoder<S> {
     type Error = Error;
 
+    async fn peek_kind(&mut self) -> Result<de::Kind, Self::Error> {
+        self.expect_whitespace().await?;
+        let byte = self.peek().await?.ok_or_else(Error::unexpected_end)?;
+        Ok(match byte {
+            b'[' => de::Kind::Seq,
+            b'{' => de::Kind::Map,
+            _ => de::Kind::Leaf,
+        })
+    }
+
+    async fn open_container(
+        &mut self,
+        kind: de::Kind,
+        size_hint: Option<usize>,
+    ) -> Result<de::Container, Self::Error> {
+        let (begin, end) = match kind {
+            de::Kind::Seq => (LIST_BEGIN, LIST_END),
+            de::Kind::Map => (MAP_BEGIN, MAP_END),
+            de::Kind::Leaf => return Err(de::Error::custom("a leaf is not a container")),
+        };
+        self.expect_whitespace().await?;
+        self.expect_delimiter(begin).await?;
+        self.push_depth()?;
+        self.expect_whitespace().await?;
+        let empty = self.maybe_delimiter(end).await?;
+        if empty {
+            self.pop_depth();
+        }
+        de::Container::new(kind, size_hint, empty)
+    }
+
+    async fn finish_child(&mut self, container: &mut de::Container) -> Result<(), Self::Error> {
+        if container.slot() == de::Slot::End {
+            return Err(de::Error::custom("container has already ended"));
+        }
+        if container.slot() == de::Slot::Key {
+            self.expect_whitespace().await?;
+            self.expect_delimiter(COLON).await?;
+            self.expect_whitespace().await?;
+            return container.advance(false);
+        }
+        self.expect_whitespace().await?;
+        let end = if container.kind() == de::Kind::Map {
+            MAP_END
+        } else {
+            LIST_END
+        };
+        let ended = self.maybe_delimiter(end).await?;
+        if !ended {
+            self.expect_delimiter(COMMA).await?;
+        }
+        container.advance(ended)?;
+        if ended {
+            self.pop_depth();
+        }
+        Ok(())
+    }
+
+    async fn inspect_any<F>(&mut self, mut inspect: F) -> Result<(), Self::Error>
+    where
+        F: for<'a> FnMut(de::Inspection<'a>) -> Result<(), Self::Error> + Send,
+    {
+        let depth = self.depth;
+        let result = self.inspect_value(&mut inspect).await;
+        self.depth = depth;
+        result
+    }
+
     async fn decode_any<V: Visitor>(&mut self, visitor: V) -> Result<V::Value, Self::Error> {
         self.expect_whitespace().await?;
 
-        while self.buffer.is_empty() && !self.source.is_terminated() {
+        while self.buffer.is_empty() && !self.source_terminated() {
             self.buffer().await?;
         }
 
@@ -853,7 +880,7 @@ impl<S: Read> de::Decoder for Decoder<S> {
         } else if self.buffer.len() >= NULL.len() && self.buffer.starts_with(NULL) {
             self.decode_option(visitor).await
         } else {
-            while self.buffer.len() < TRUE.len() && !self.source.is_terminated() {
+            while self.buffer.len() < TRUE.len() && !self.source_terminated() {
                 self.buffer().await?;
             }
 
@@ -864,7 +891,7 @@ impl<S: Read> de::Decoder for Decoder<S> {
             } else if self.buffer.starts_with(NULL) {
                 self.decode_option(visitor).await
             } else {
-                while self.buffer.len() < FALSE.len() && !self.source.is_terminated() {
+                while self.buffer.len() < FALSE.len() && !self.source_terminated() {
                     self.buffer().await?;
                 }
 
@@ -1044,7 +1071,7 @@ impl<S: Read> de::Decoder for Decoder<S> {
     async fn decode_option<V: Visitor>(&mut self, visitor: V) -> Result<V::Value, Self::Error> {
         self.expect_whitespace().await?;
 
-        while self.buffer.len() < NULL.len() && !self.source.is_terminated() {
+        while self.buffer.len() < NULL.len() && !self.source_terminated() {
             self.buffer().await?;
         }
 
@@ -1095,7 +1122,7 @@ impl<S: Read> de::Decoder for Decoder<S> {
         &mut self,
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
-        self.ignore_value().await?;
+        self.inspect_any(|_| Ok(())).await?;
         visitor.visit_unit()
     }
 }
@@ -1105,7 +1132,9 @@ impl<S: Read> From<S> for Decoder<S> {
         Self {
             source,
             buffer: vec![],
+            pending: Bytes::new(),
             numeric: NUMERIC.iter().cloned().collect(),
+            depth: 0,
         }
     }
 }
@@ -1119,17 +1148,8 @@ pub async fn decode<S: Stream<Item = Bytes> + Send + Unpin, T: FromStream>(
     let mut decoder = Decoder::from(SourceStream::from(source));
 
     let decoded = T::from_stream(context, &mut decoder).await?;
-    decoder.expect_whitespace().await?;
-
-    if decoder.is_terminated() {
-        Ok(decoded)
-    } else {
-        let buffer = decoder.contents(SNIPPET_LEN)?;
-        Err(de::Error::custom(format!(
-            "expected end of stream, found `{}...`",
-            buffer
-        )))
-    }
+    decoder.ensure_eof().await?;
+    Ok(decoded)
 }
 
 /// Decode the given JSON-encoded stream of bytes into an instance of `T` using the given context.
@@ -1143,17 +1163,8 @@ pub async fn try_decode<
 ) -> Result<T, Error> {
     let mut decoder = Decoder::from_stream(source.map_err(|e| de::Error::custom(e)));
     let decoded = T::from_stream(context, &mut decoder).await?;
-    decoder.expect_whitespace().await?;
-
-    if decoder.is_terminated() {
-        Ok(decoded)
-    } else {
-        let snippet = decoder.contents(SNIPPET_LEN)?;
-        Err(de::Error::custom(format!(
-            "expected end of stream, found `{}...`",
-            snippet
-        )))
-    }
+    decoder.ensure_eof().await?;
+    Ok(decoded)
 }
 
 /// Decode the given JSON-encoded stream of bytes into an instance of `T` using the given context.
@@ -1163,7 +1174,10 @@ pub async fn read_from<S: AsyncReadExt + Send + Unpin, T: FromStream>(
     context: T::Context,
     source: S,
 ) -> Result<T, Error> {
-    T::from_stream(context, &mut Decoder::from(SourceReader::from(source))).await
+    let mut decoder = Decoder::from(SourceReader::from(source));
+    let decoded = T::from_stream(context, &mut decoder).await?;
+    decoder.ensure_eof().await?;
+    Ok(decoded)
 }
 
 fn decode_hex_val(val: u8) -> Option<u16> {
@@ -1184,10 +1198,9 @@ mod tests {
 
     use super::*;
 
-    /// next_or_eof should return the next char in the buffer/stream, or
-    /// if we've hit the EOF, throw an error.
+    /// Character consumption crosses chunks and reports EOF without a payload.
     #[tokio::test]
-    async fn test_next_or_eof() {
+    async fn test_next_char() {
         let s = b"bar";
         for num_chunks in (1..s.len()).rev() {
             let source = stream::iter(s.iter().copied())
@@ -1197,11 +1210,10 @@ mod tests {
 
             let mut decoder = Decoder::from_stream(source);
             for expected in s {
-                let actual = decoder.next_or_eof().await.unwrap();
+                let actual = decoder.next_char().await.unwrap().unwrap();
                 assert_eq!(&actual, expected);
             }
-            let res = decoder.next_or_eof().await;
-            assert!(res.is_err());
+            assert_eq!(decoder.next_char().await.unwrap(), None);
         }
     }
 
@@ -1256,7 +1268,7 @@ mod tests {
     async fn test_ignore_string(source: &str, expected: Result<usize, Error>) {
         let mut decoder = test_decoder(source);
 
-        let res = decoder.ignore_string().await;
+        let res = decoder.inspect_string(&mut |_| Ok(())).await;
 
         match expected {
             Ok(end_length) => assert_eq!(decoder.buffer.len(), end_length),
@@ -1267,13 +1279,13 @@ mod tests {
     #[test_case("-123", Ok(0); "negative number")]
     #[test_case("-123.45", Ok(0); "negative float")]
     #[test_case("abc", Err(Error::invalid_utf8("unexpected token ignoring value: 97")); "non number")]
-    #[test_case("", Ok(0); "empty source")]
+    #[test_case("", Err(Error::unexpected_end()); "empty source")]
     #[tokio::test]
     async fn test_ignore_value(source: &str, expected: Result<usize, Error>) {
         let mut decoder = test_decoder(source);
 
-        // `ignore_number` only works on positive numbers.  `ignore_value` will eat that b'-'
-        let res = decoder.ignore_value().await;
+        // Shared inspection handles the leading sign before numerical traversal.
+        let res = de::Decoder::inspect_any(&mut decoder, |_| Ok(())).await;
 
         if let Ok(end_length) = expected {
             res.unwrap();
@@ -1318,15 +1330,15 @@ mod tests {
     #[test_case("[],[]", Ok(3); "ends correctly")]
     #[test_case("[\"foo\",\"bar\"]", Ok(0); "string array")]
     #[test_case(r#""#, Err(Error::unexpected_end()); "unexpected end")]
-    #[test_case(r#"["test""test"]"#, Err(Error::invalid_utf8("invalid char 34, expected , or ]")); "no comma")]
+    #[test_case(r#"["test""test"]"#, Err(de::Error::custom(r#"unexpected delimiter ", expected , at `"test"]`..."#)); "no comma")]
     #[tokio::test]
     async fn test_ignore_array(source: &str, expected: Result<usize, Error>) {
         let mut decoder = test_decoder(source);
-        let res = decoder.ignore_array().await;
+        let res = de::Decoder::inspect_any(&mut decoder, |_| Ok(())).await;
 
         match expected {
             Ok(end_length) => assert_eq!(decoder.buffer.len(), end_length),
-            Err(e) => assert_eq!(res.unwrap_err(), e),
+            Err(e) => assert_eq!(Err(e), res),
         }
     }
 
@@ -1338,14 +1350,14 @@ mod tests {
     #[test_case(r#"{ } "#, Ok(1); "whitespace empty object")]
     #[test_case(r#"{"k" : 2 , " k " : 3 }"#, Ok(0); "whitespace multi object")]
     #[test_case(r#"{ " k " : 1 } "#, Ok(1); "whitespace single object")]
-    #[test_case(r#"{"k""v"}"#, Err(Error::invalid_utf8("invalid char 34, expected 58")); "missing colon")]
-    #[test_case(r#"{"k","v"}"#, Err(Error::invalid_utf8("invalid char 44, expected 58")); "comma when expecting colon")]
-    #[test_case(r#"{,"k":"v"}"#, Err(Error::invalid_utf8("invalid char 107, expected 58")); "comma when expecting value")]
-    #[test_case(r#"{"k":"v"asdf}"#, Err(Error::invalid_utf8("invalid char 97, expected , or }")); "value when expecting comma")]
+    #[test_case(r#"{"k""v"}"#, Err(de::Error::custom(r#"unexpected delimiter ", expected : at `"v"}`..."#)); "missing colon")]
+    #[test_case(r#"{"k","v"}"#, Err(de::Error::custom(r#"unexpected delimiter ,, expected : at `,"v"}`..."#)); "comma when expecting colon")]
+    #[test_case(r#"{,"k":"v"}"#, Err(Error::invalid_utf8("unexpected token ignoring value: 44")); "comma when expecting value")]
+    #[test_case(r#"{"k":"v"asdf}"#, Err(de::Error::custom("unexpected delimiter a, expected , at `asdf}`...")); "value when expecting comma")]
     #[tokio::test]
     async fn test_ignore_object(source: &str, expected: Result<usize, Error>) {
         let mut decoder = test_decoder(source);
-        let res = decoder.ignore_object().await;
+        let res = de::Decoder::inspect_any(&mut decoder, |_| Ok(())).await;
 
         match expected {
             Err(e) => assert_eq!(Err(e), res),
@@ -1353,3 +1365,9 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod inspection_tests;
+
+#[cfg(test)]
+mod shallow_tests;
