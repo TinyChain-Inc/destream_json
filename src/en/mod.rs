@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::constants::*;
 
+mod events;
 mod stream;
 
 /// A [`Stream`] of JSON-encoded data
@@ -98,25 +99,13 @@ impl<'en> en::EncodeMap<'en> for MapEncoder<'en> {
         Ok(())
     }
 
-    fn end(mut self) -> Result<Self::Ok, Self::Error> {
+    fn end(self) -> Result<Self::Ok, Self::Error> {
         if self.pending_key.is_some() {
             return Err(en::Error::custom(
                 "You must call encode_value after calling encode_key",
             ));
         }
-
-        let mut encoded = delimiter(MAP_BEGIN);
-
-        while let Some((key, value)) = self.entries.pop_front() {
-            encoded = Box::pin(encoded.chain(key).chain(delimiter(COLON)).chain(value));
-
-            if !self.entries.is_empty() {
-                encoded = Box::pin(encoded.chain(delimiter(COMMA)));
-            }
-        }
-
-        encoded = Box::pin(encoded.chain(delimiter(MAP_END)));
-        Ok(encoded)
+        Ok(stream::encode_map_encoded(self.entries))
     }
 }
 
@@ -141,19 +130,8 @@ impl<'en> SequenceEncoder<'en> {
         self.items.push_back(value);
     }
 
-    fn encode(mut self) -> Result<JSONStream<'en>, Error> {
-        let mut encoded = delimiter(LIST_BEGIN);
-
-        while let Some(item) = self.items.pop_front() {
-            encoded = Box::pin(encoded.chain(item));
-
-            if !self.items.is_empty() {
-                encoded = Box::pin(encoded.chain(delimiter(COMMA)));
-            }
-        }
-
-        encoded = Box::pin(encoded.chain(delimiter(LIST_END)));
-        Ok(encoded)
+    fn encode(self) -> Result<JSONStream<'en>, Error> {
+        Ok(stream::encode_list_encoded(self.items))
     }
 }
 
@@ -216,6 +194,14 @@ impl<'en> en::Encoder<'en> for Encoder {
     type EncodeMap = MapEncoder<'en>;
     type EncodeSeq = SequenceEncoder<'en>;
     type EncodeTuple = SequenceEncoder<'en>;
+
+    fn encode_events<T, S>(self, events: S) -> Result<Self::Ok, Self::Error>
+    where
+        T: en::IntoStream<'en> + 'en,
+        S: Stream<Item = Result<en::Event<T>, Self::Error>> + Send + 'en,
+    {
+        Ok(events::encode(events))
+    }
 
     #[inline]
     fn encode_bool(self, v: bool) -> Result<Self::Ok, Self::Error> {
@@ -529,12 +515,6 @@ fn escape<T: fmt::Display>(value: T) -> Bytes {
 fn encode_fmt<'en, T: fmt::Display>(value: T) -> JSONStream<'en> {
     let encoded = escape(value);
     Box::pin(futures::stream::once(future::ready(Ok(encoded))))
-}
-
-#[inline]
-fn delimiter<'en>(delimiter: &'static [u8]) -> JSONStream<'en> {
-    let encoded = futures::stream::once(future::ready(Ok(Bytes::from_static(delimiter))));
-    Box::pin(encoded)
 }
 
 /// Given an encodable value, return an encoded stream.

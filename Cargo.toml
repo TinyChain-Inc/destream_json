@@ -19,8 +19,7 @@ value = ["number-general/stream"]
 all = ["tokio-io", "value"]
 
 [dependencies]
-async-recursion = "1.1"
-base64 = "0.22"
+base64 = "0.23"
 bytes = "1.7"
 destream = { path = "../destream", version = "0.10" }
 futures = "0.3"
