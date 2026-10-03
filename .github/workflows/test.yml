@@ -119,6 +119,11 @@ jobs:
           toolchain: ${{matrix.rust}}
           targets: ${{matrix.target}}
       - uses: r7kamura/rust-problem-matchers@v1.5.0
+      - name: Resolve MSRV-compatible dependencies
+        if: matrix.rust == '1.85.0'
+        env:
+          CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
+        run: cargo generate-lockfile
       - run: cargo check
       - run: cargo check --features tokio-io
       - run: cargo check --features value
