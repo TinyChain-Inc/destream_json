@@ -35,3 +35,9 @@ tokio = { version = "1.39", features = ["fs", "macros"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tokio-test = "0.4"
 test-case = "3.3.1"
+criterion = { version = "0.5", features = ["html_reports", "async_futures"] }
+
+[[bench]]
+name = "bench"
+harness = false
+required-features = ["value"]
