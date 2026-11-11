@@ -1,16 +1,12 @@
 //! Decode a JSON stream to a Rust data structure.
 
-use std::collections::HashSet;
 use std::fmt;
 use std::str::FromStr;
 
-use bytes::{BufMut, Bytes};
+use bytes::Bytes;
 use destream::{de, FromStream, Visitor};
-use futures::{
-    stream::{Fuse, FusedStream, Stream, StreamExt, TryStreamExt},
-    FutureExt as _,
-};
-
+use futures::stream::{Fuse, FusedStream, Stream, StreamExt, TryStreamExt};
+use futures::FutureExt as _;
 #[cfg(feature = "tokio-io")]
 use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
 
@@ -161,6 +157,7 @@ impl<'a, S: Read + 'a> de::MapAccess for MapAccess<'a, S> {
         if self.container.slot() == de::Slot::End {
             return Ok(None);
         }
+
         self.decoder.expect_whitespace().await?;
         let key = K::from_stream(context, self.decoder).await?;
         de::Decoder::finish_child(self.decoder, &mut self.container).await?;
@@ -171,6 +168,7 @@ impl<'a, S: Read + 'a> de::MapAccess for MapAccess<'a, S> {
         if self.container.slot() != de::Slot::Value {
             return Err(de::Error::custom("expected a map value after its key"));
         }
+
         let value = V::from_stream(context, self.decoder).await?;
         de::Decoder::finish_child(self.decoder, &mut self.container).await?;
         Ok(value)
@@ -203,6 +201,7 @@ impl<'a, S: Read + 'a> de::SeqAccess for SeqAccess<'a, S> {
         if self.container.slot() == de::Slot::End {
             return Ok(None);
         }
+
         self.decoder.expect_whitespace().await?;
         let value = T::from_stream(context, self.decoder).await?;
         de::Decoder::finish_child(self.decoder, &mut self.container).await?;
@@ -246,7 +245,6 @@ pub struct Decoder<S> {
     source: S,
     pending: Bytes,
     buffer: Vec<u8>,
-    numeric: HashSet<u8>,
     depth: usize,
 }
 
@@ -260,7 +258,6 @@ where
             source: SourceReader::from(reader),
             buffer: Vec::new(),
             pending: Bytes::new(),
-            numeric: NUMERIC.iter().cloned().collect(),
             depth: 0,
         }
     }
@@ -271,6 +268,7 @@ impl<S> Decoder<S> {
         if self.depth == MAX_DEPTH {
             return Err(de::Error::custom("nesting depth limit exceeded (max 1024)"));
         }
+
         self.depth += 1;
         Ok(())
     }
@@ -296,7 +294,6 @@ where
             source: SourceStream::from(stream),
             buffer: Vec::new(),
             pending: Bytes::new(),
-            numeric: NUMERIC.iter().cloned().collect(),
             depth: 0,
         }
     }
@@ -318,53 +315,22 @@ impl<S: Read> Decoder<S> {
                 self.pending = data?;
             }
         }
+
         let len = self.pending.len().min(CHUNK_SIZE);
         self.buffer.extend_from_slice(&self.pending.split_to(len));
         Ok(())
     }
 
     async fn buffer_string(&mut self) -> Result<Vec<u8>, Error> {
-        self.expect_delimiter(QUOTE).await?;
-
-        let mut i = 0;
-        let mut escaped = false;
-        loop {
-            while i >= self.buffer.len() && !self.source_terminated() {
-                self.buffer().await?;
+        let mut value = Vec::new();
+        self.inspect_string(&mut |part| {
+            if let de::Inspection::TextChunk(bytes) = part {
+                value.extend_from_slice(bytes);
             }
-
-            if i < self.buffer.len() && &self.buffer[i..i + 1] == QUOTE && !escaped {
-                break;
-            } else if i >= self.buffer.len() && self.source_terminated() {
-                return Err(Error::unexpected_end());
-            }
-
-            if escaped {
-                escaped = false;
-            } else if self.buffer[i] == ESCAPE[0] {
-                escaped = true;
-            }
-
-            i += 1;
-        }
-
-        let mut s = Vec::with_capacity(i);
-        let mut escape = false;
-        for byte in self.buffer.drain(0..i) {
-            let as_slice = std::slice::from_ref(&byte);
-            if escape {
-                s.put_u8(byte);
-                escape = false;
-            } else if as_slice == ESCAPE {
-                escape = true;
-            } else {
-                s.put_u8(byte);
-            }
-        }
-
-        self.buffer.remove(0); // process the end quote
-        self.buffer.shrink_to_fit();
-        Ok(s)
+            Ok(())
+        })
+        .await?;
+        Ok(value)
     }
 
     async fn buffer_while<F: Fn(u8) -> bool>(&mut self, cond: F) -> Result<usize, Error> {
@@ -415,22 +381,19 @@ impl<S: Read> Decoder<S> {
     }
 
     async fn decode_number<V: Visitor>(&mut self, visitor: V) -> Result<V::Value, Error> {
-        let mut i = 0;
-        loop {
-            if self.buffer[i] == DECIMAL[0] || self.buffer[i] == E[0] {
-                return de::Decoder::decode_f64(self, visitor).await;
-            } else if !self.numeric.contains(&self.buffer[i]) {
-                return de::Decoder::decode_i64(self, visitor).await;
-            }
-
-            i += 1;
-            while i >= self.buffer.len() && !self.source_terminated() {
-                self.buffer().await?;
-            }
-
-            if i >= self.buffer.len() && self.source_terminated() {
-                return de::Decoder::decode_i64(self, visitor).await;
-            }
+        let len = self.buffer_while(|byte| NUMERIC.contains(&byte)).await?;
+        let token = &self.buffer[..len];
+        if token.iter().any(|byte| matches!(byte, b'.' | b'e' | b'E')) {
+            de::Decoder::decode_f64(self, visitor).await
+        } else if token.starts_with(b"-")
+            || std::str::from_utf8(token)
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+                .is_some()
+        {
+            de::Decoder::decode_i64(self, visitor).await
+        } else {
+            de::Decoder::decode_u64(self, visitor).await
         }
     }
 
@@ -472,10 +435,11 @@ impl<S: Read> Decoder<S> {
             while self.buffer.is_empty() && !self.source_terminated() {
                 self.buffer().await?;
             }
+
             let count = self
                 .buffer
                 .iter()
-                .take_while(|byte| byte.is_ascii_whitespace())
+                .take_while(|&&byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
                 .count();
             let done = count < self.buffer.len() || self.source_terminated();
             self.buffer.drain(..count);
@@ -485,76 +449,115 @@ impl<S: Read> Decoder<S> {
         }
     }
 
+    async fn string_hex(&mut self) -> Result<u16, Error> {
+        let mut value = 0;
+        for _ in 0..4 {
+            let byte = self.next_char().await?.ok_or_else(Error::unexpected_end)?;
+            value = (value << 4)
+                | decode_hex_val(byte)
+                    .ok_or_else(|| Error::invalid_utf8("invalid escape decoding hex escape"))?;
+        }
+
+        Ok(value)
+    }
+
     async fn inspect_string<F>(&mut self, inspect: &mut F) -> Result<(), Error>
     where
         F: for<'a> FnMut(de::Inspection<'a>) -> Result<(), Error> + Send,
     {
         self.expect_delimiter(QUOTE).await?;
-        let mut output = [0; 4096];
-        let mut len = 0;
-        let mut capacity_bound = 0usize;
-        let mut escaped = false;
-        let mut hex_digits = 0;
+        let mut output = [0u8; CHUNK_SIZE];
+        let mut len = 0usize;
+        let mut total = 0usize;
         loop {
-            while self.buffer.is_empty() && !self.source_terminated() {
-                self.buffer().await?;
-            }
-            if self.buffer.is_empty() {
-                return Err(Error::unexpected_end());
-            }
-            let mut consumed = 0;
-            let mut done = false;
-            for &byte in &self.buffer {
-                if len == output.len() {
-                    break;
-                }
-                consumed += 1;
-                if !escaped && hex_digits == 0 && byte == b'"' {
-                    done = true;
-                    break;
-                }
-                capacity_bound = capacity_bound
-                    .checked_add(1)
-                    .ok_or_else(|| de::Error::custom("string size overflow"))?;
-                if hex_digits != 0 {
-                    decode_hex_val(byte)
-                        .ok_or_else(|| Error::invalid_utf8("invalid escape decoding hex escape"))?;
-                    hex_digits -= 1;
-                } else if escaped {
-                    match byte {
-                        b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {}
-                        b'u' => hex_digits = 4,
-                        _ => return Err(Error::invalid_utf8("invalid escape character in string")),
+            let byte = self.peek().await?.ok_or_else(Error::unexpected_end)?;
+            let done = byte == b'"';
+            if done {
+                self.eat_char().await?;
+            } else if byte == b'\\' {
+                self.eat_char().await?;
+                let escaped = match self.next_char().await?.ok_or_else(Error::unexpected_end)? {
+                    b'"' => Some(b'"'),
+                    b'\\' => Some(b'\\'),
+                    b'/' => Some(b'/'),
+                    b'b' => Some(8),
+                    b'f' => Some(12),
+                    b'n' => Some(b'\n'),
+                    b'r' => Some(b'\r'),
+                    b't' => Some(b'\t'),
+                    b'u' => {
+                        let first = self.string_hex().await?;
+                        let code = if (0xd800..=0xdbff).contains(&first) {
+                            if self.next_char().await? != Some(b'\\')
+                                || self.next_char().await? != Some(b'u')
+                            {
+                                return Err(Error::invalid_utf8("missing low Unicode surrogate"));
+                            }
+
+                            let second = self.string_hex().await?;
+                            if !(0xdc00..=0xdfff).contains(&second) {
+                                return Err(Error::invalid_utf8("invalid low Unicode surrogate"));
+                            }
+                            0x10000 + ((u32::from(first) - 0xd800) << 10) + u32::from(second)
+                                - 0xdc00
+                        } else {
+                            u32::from(first)
+                        };
+                        let character = char::from_u32(code)
+                            .ok_or_else(|| Error::invalid_utf8("invalid Unicode scalar"))?;
+                        let mut encoded = [0; 4];
+                        let encoded = character.encode_utf8(&mut encoded).as_bytes();
+                        output[len..len + encoded.len()].copy_from_slice(encoded);
+                        len += encoded.len();
+                        None
                     }
-                    escaped = false;
-                } else if byte == b'\\' {
-                    escaped = true;
-                    continue;
-                } else if byte < 0x20 {
-                    return Err(Error::invalid_utf8(format!(
-                        "invalid control character in string: {byte}"
-                    )));
+                    _ => return Err(Error::invalid_utf8("invalid escape character in string")),
+                };
+                if let Some(escaped) = escaped {
+                    output[len] = escaped;
+                    len += 1;
                 }
-                // Match the ordinary decoder: it removes the escape backslash,
-                // retaining the following bytes rather than expanding escapes.
-                output[len] = byte;
-                len += 1;
+            } else if byte < 0x20 {
+                return Err(Error::invalid_utf8(format!(
+                    "invalid control character in string: {byte}"
+                )));
+            } else {
+                let count = self
+                    .buffer
+                    .iter()
+                    .take(CHUNK_SIZE - len)
+                    .take_while(|&&byte| byte >= 0x20 && byte != b'"' && byte != b'\\')
+                    .count();
+                output[len..len + count].copy_from_slice(&self.buffer[..count]);
+                self.buffer.drain(..count);
+                len += count;
             }
-            self.buffer.drain(..consumed);
-            if len == output.len() || done {
+
+            if len >= CHUNK_SIZE - 4 || done {
                 let valid = match std::str::from_utf8(&output[..len]) {
                     Ok(_) => len,
                     Err(error) if !done && error.error_len().is_none() => error.valid_up_to(),
                     Err(error) => return Err(Error::invalid_utf8(error)),
                 };
+
                 if valid != 0 {
                     inspect(de::Inspection::TextChunk(&output[..valid]))?;
+                    total = total
+                        .checked_add(valid)
+                        .ok_or_else(|| de::Error::custom("string size overflow"))?;
                     output.copy_within(valid..len, 0);
                     len -= valid;
                 }
-            }
-            if done {
-                return inspect(de::Inspection::TextEnd { capacity_bound });
+
+                if done {
+                    return inspect(de::Inspection::TextEnd {
+                        capacity_bound: if total == 0 {
+                            0
+                        } else {
+                            total.saturating_mul(2).max(8)
+                        },
+                    });
+                }
             }
         }
     }
@@ -658,9 +661,12 @@ impl<S: Read> Decoder<S> {
     {
         self.expect_whitespace().await?;
 
-        let numeric = self.numeric.clone();
-        let i = self.buffer_while(|b| numeric.contains(&b)).await?;
+        let i = self.buffer_while(|b| NUMERIC.contains(&b)).await?;
         let n = String::from_utf8(self.buffer[0..i].to_vec()).map_err(Error::invalid_utf8)?;
+
+        if !valid_number(n.as_bytes()) {
+            return Err(de::Error::invalid_value(n, "a JSON number"));
+        }
 
         match n.parse() {
             Ok(number) => {
@@ -707,6 +713,7 @@ impl<S: Read> Decoder<S> {
                 }
             }
         }
+
         Ok(())
     }
 
@@ -808,6 +815,7 @@ impl<S: Read> de::Decoder for Decoder<S> {
             de::Kind::Map => (MAP_BEGIN, MAP_END),
             de::Kind::Leaf => return Err(de::Error::custom("a leaf is not a container")),
         };
+
         self.expect_whitespace().await?;
         self.expect_delimiter(begin).await?;
         self.push_depth()?;
@@ -823,12 +831,14 @@ impl<S: Read> de::Decoder for Decoder<S> {
         if container.slot() == de::Slot::End {
             return Err(de::Error::custom("container has already ended"));
         }
+
         if container.slot() == de::Slot::Key {
             self.expect_whitespace().await?;
             self.expect_delimiter(COLON).await?;
             self.expect_whitespace().await?;
             return container.advance(false);
         }
+
         self.expect_whitespace().await?;
         let end = if container.kind() == de::Kind::Map {
             MAP_END
@@ -843,6 +853,7 @@ impl<S: Read> de::Decoder for Decoder<S> {
         if ended {
             self.pop_depth();
         }
+
         Ok(())
     }
 
@@ -871,7 +882,7 @@ impl<S: Read> de::Decoder for Decoder<S> {
             self.decode_seq(visitor).await
         } else if self.buffer.starts_with(MAP_BEGIN) {
             self.decode_map(visitor).await
-        } else if self.numeric.contains(&self.buffer[0]) {
+        } else if NUMERIC.contains(&self.buffer[0]) {
             self.decode_number(visitor).await
         } else if (self.buffer.len() >= FALSE.len() && self.buffer.starts_with(FALSE))
             || (self.buffer.len() >= TRUE.len() && self.buffer.starts_with(TRUE))
@@ -964,12 +975,18 @@ impl<S: Read> de::Decoder for Decoder<S> {
     }
 
     async fn decode_f32<V: Visitor>(&mut self, visitor: V) -> Result<V::Value, Self::Error> {
-        let f = self.parse_number().await?;
+        let f: f32 = self.parse_number().await?;
+        if !f.is_finite() {
+            return Err(de::Error::invalid_value(f, "a finite f32"));
+        }
         visitor.visit_f32(f)
     }
 
     async fn decode_f64<V: Visitor>(&mut self, visitor: V) -> Result<V::Value, Self::Error> {
-        let f = self.parse_number().await?;
+        let f: f64 = self.parse_number().await?;
+        if !f.is_finite() {
+            return Err(de::Error::invalid_value(f, "a finite f64"));
+        }
         visitor.visit_f64(f)
     }
 
@@ -986,7 +1003,7 @@ impl<S: Read> de::Decoder for Decoder<S> {
         visitor: V,
     ) -> Result<<V as Visitor>::Value, Self::Error> {
         let access = SeqAccess::new(self, None).await?;
-        visitor.visit_array_bool(access).boxed().await
+        visitor.visit_array_i8(access).boxed().await
     }
 
     async fn decode_array_i16<V: Visitor>(
@@ -1133,7 +1150,6 @@ impl<S: Read> From<S> for Decoder<S> {
             source,
             buffer: vec![],
             pending: Bytes::new(),
-            numeric: NUMERIC.iter().cloned().collect(),
             depth: 0,
         }
     }
@@ -1178,6 +1194,42 @@ pub async fn read_from<S: AsyncReadExt + Send + Unpin, T: FromStream>(
     let decoded = T::from_stream(context, &mut decoder).await?;
     decoder.ensure_eof().await?;
     Ok(decoded)
+}
+
+fn valid_number(mut token: &[u8]) -> bool {
+    if token.first() == Some(&b'-') {
+        token = &token[1..];
+    }
+
+    match token.first() {
+        Some(b'0') => token = &token[1..],
+        Some(b'1'..=b'9') => {
+            token = &token[token.iter().take_while(|b| b.is_ascii_digit()).count()..]
+        }
+        _ => return false,
+    }
+
+    if token.first() == Some(&b'.') {
+        token = &token[1..];
+        let len = token.iter().take_while(|b| b.is_ascii_digit()).count();
+        if len == 0 {
+            return false;
+        }
+        token = &token[len..];
+    }
+
+    if matches!(token.first(), Some(b'e' | b'E')) {
+        token = &token[1..];
+        if matches!(token.first(), Some(b'+' | b'-')) {
+            token = &token[1..];
+        }
+        let len = token.iter().take_while(|b| b.is_ascii_digit()).count();
+        if len == 0 {
+            return false;
+        }
+        token = &token[len..];
+    }
+    token.is_empty()
 }
 
 fn decode_hex_val(val: u8) -> Option<u16> {

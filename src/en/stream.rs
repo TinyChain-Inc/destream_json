@@ -6,12 +6,11 @@ use bytes::Bytes;
 use destream::en::{self, IntoStream};
 use futures::ready;
 use futures::stream::{Fuse, FusedStream, Stream, StreamExt};
+use futures::task::Context;
 use pin_project::pin_project;
 
-use crate::constants::*;
-
 use super::{Encoder, JSONStream};
-use futures::task::Context;
+use crate::constants::*;
 
 #[pin_project]
 struct JSONMapEntryStream<'en> {
@@ -73,7 +72,7 @@ struct JSONEncodingStream<
     #[pin]
     source: Fuse<S>,
 
-    next: Option<Pin<Box<I>>>,
+    next: Option<I>,
 
     started: bool,
     finished: bool,
@@ -82,8 +81,10 @@ struct JSONEncodingStream<
     end: &'static [u8],
 }
 
-impl<I: Stream<Item = Result<Bytes, super::Error>>, S: Stream<Item = Result<I, super::Error>>>
-    Stream for JSONEncodingStream<I, S>
+impl<
+        I: Stream<Item = Result<Bytes, super::Error>> + Unpin,
+        S: Stream<Item = Result<I, super::Error>>,
+    > Stream for JSONEncodingStream<I, S>
 {
     type Item = Result<Bytes, super::Error>;
 
@@ -92,13 +93,13 @@ impl<I: Stream<Item = Result<Bytes, super::Error>>, S: Stream<Item = Result<I, s
 
         Poll::Ready(loop {
             match this.next {
-                Some(next) => match ready!(next.as_mut().poll_next(cxt)) {
+                Some(next) => match ready!(Pin::new(next).poll_next(cxt)) {
                     Some(result) => break Some(result),
                     None => *this.next = None,
                 },
                 None => match ready!(this.source.as_mut().poll_next(cxt)) {
                     Some(Ok(next)) => {
-                        *this.next = Some(Box::pin(next));
+                        *this.next = Some(next);
 
                         if *this.started {
                             break Some(Ok(Bytes::from_static(COMMA)));
@@ -123,8 +124,10 @@ impl<I: Stream<Item = Result<Bytes, super::Error>>, S: Stream<Item = Result<I, s
     }
 }
 
-impl<I: Stream<Item = Result<Bytes, super::Error>>, S: Stream<Item = Result<I, super::Error>>>
-    FusedStream for JSONEncodingStream<I, S>
+impl<
+        I: Stream<Item = Result<Bytes, super::Error>> + Unpin,
+        S: Stream<Item = Result<I, super::Error>>,
+    > FusedStream for JSONEncodingStream<I, S>
 {
     fn is_terminated(&self) -> bool {
         self.finished
@@ -195,3 +198,7 @@ pub(super) fn encode_map_encoded<'en>(
         end: MAP_END,
     })
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/encoding.rs"]
+mod tests;

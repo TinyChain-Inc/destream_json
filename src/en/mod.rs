@@ -1,8 +1,8 @@
 //! Encode a Rust data structure into JSON data.
+//! Container streams consume children lazily and retain movable child handles inline.
 
 use std::collections::VecDeque;
 use std::fmt;
-use std::mem;
 use std::pin::Pin;
 
 use bytes::{BufMut, Bytes, BytesMut};
@@ -92,9 +92,7 @@ impl<'en> en::EncodeMap<'en> for MapEncoder<'en> {
 
         let value = value.into_stream(Encoder)?;
 
-        let mut key = None;
-        mem::swap(&mut self.pending_key, &mut key);
-
+        let key = self.pending_key.take();
         self.entries.push_back((key.unwrap(), value));
         Ok(())
     }
@@ -105,6 +103,7 @@ impl<'en> en::EncodeMap<'en> for MapEncoder<'en> {
                 "You must call encode_value after calling encode_key",
             ));
         }
+
         Ok(stream::encode_map_encoded(self.entries))
     }
 }
@@ -124,15 +123,6 @@ impl<'en> SequenceEncoder<'en> {
 
         Self { items }
     }
-
-    #[inline]
-    fn push(&mut self, value: JSONStream<'en>) {
-        self.items.push_back(value);
-    }
-
-    fn encode(self) -> Result<JSONStream<'en>, Error> {
-        Ok(stream::encode_list_encoded(self.items))
-    }
 }
 
 impl<'en> en::EncodeSeq<'en> for SequenceEncoder<'en> {
@@ -142,12 +132,12 @@ impl<'en> en::EncodeSeq<'en> for SequenceEncoder<'en> {
     #[inline]
     fn encode_element<T: IntoStream<'en> + 'en>(&mut self, value: T) -> Result<(), Self::Error> {
         let encoded = value.into_stream(Encoder)?;
-        self.push(encoded);
+        self.items.push_back(encoded);
         Ok(())
     }
 
     fn end(self) -> Result<Self::Ok, Self::Error> {
-        self.encode()
+        Ok(stream::encode_list_encoded(self.items))
     }
 }
 
@@ -158,12 +148,12 @@ impl<'en> en::EncodeTuple<'en> for SequenceEncoder<'en> {
     #[inline]
     fn encode_element<T: IntoStream<'en> + 'en>(&mut self, value: T) -> Result<(), Self::Error> {
         let encoded = value.into_stream(Encoder)?;
-        self.push(encoded);
+        self.items.push_back(encoded);
         Ok(())
     }
 
     fn end(self) -> Result<Self::Ok, Self::Error> {
-        self.encode()
+        Ok(stream::encode_list_encoded(self.items))
     }
 }
 
@@ -264,7 +254,7 @@ impl<'en> en::Encoder<'en> for Encoder {
                 v
             )))
         } else {
-            Ok(encode_fmt(v))
+            Ok(encode_fmt(f64::from(v)))
         }
     }
 
@@ -499,13 +489,25 @@ impl<'en> en::Encoder<'en> for Encoder {
 fn escape<T: fmt::Display>(value: T) -> Bytes {
     let as_str = value.to_string();
     let mut encoded = BytesMut::with_capacity(as_str.len());
-    for byte in as_str.as_bytes() {
-        let as_slice = std::slice::from_ref(byte);
-        if as_slice == QUOTE || as_slice == ESCAPE {
-            encoded.extend_from_slice(ESCAPE);
+    for &byte in as_str.as_bytes() {
+        match byte {
+            b'"' | b'\\' => {
+                encoded.put_u8(b'\\');
+                encoded.put_u8(byte);
+            }
+            0..=0x1f => {
+                let hex = b"0123456789abcdef";
+                encoded.extend_from_slice(&[
+                    b'\\',
+                    b'u',
+                    b'0',
+                    b'0',
+                    hex[(byte >> 4) as usize],
+                    hex[(byte & 15) as usize],
+                ]);
+            }
+            _ => encoded.put_u8(byte),
         }
-
-        encoded.put_u8(*byte);
     }
 
     encoded.into()
