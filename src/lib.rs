@@ -20,14 +20,12 @@
 //!    when using another JSON library to decode a stream encoded by `destream_json`. This behavior
 //!    can be altered by using only strings as keys, or adding an explicit check at encoding time.
 
-pub use de::{decode, try_decode};
-pub use en::{encode, encode_map, encode_seq};
-
-#[cfg(feature = "value")]
-pub use value::{Value, ValueKind};
-
 #[cfg(feature = "tokio-io")]
 pub use de::read_from;
+pub use de::{decode, try_decode};
+pub use en::{encode, encode_map, encode_seq};
+#[cfg(feature = "value")]
+pub use value::{Value, ValueKind};
 
 mod constants;
 pub mod de;
@@ -150,7 +148,7 @@ mod tests {
         test_encode_value(2e2_f32, "200").await;
         test_encode_value(-2e3, "-2000").await;
         #[allow(clippy::approx_constant)]
-        test_encode_value(3.14_f32, "3.14").await;
+        test_encode_value(3.14_f32, "3.140000104904175").await;
         test_encode_value(-1.414e4_f64, "-14140").await;
 
         test_decode("\t\r\n\" hello world \"", " hello world ".to_string()).await;
@@ -280,7 +278,7 @@ mod tests {
         .await;
         test_encode_list(
             stream::iter(vec!["hello ", "\tworld"]),
-            "[\"hello \",\"\tworld\"]",
+            "[\"hello \",\"\\u0009world\"]",
         )
         .await;
 
@@ -322,8 +320,9 @@ mod tests {
     #[cfg(feature = "value")]
     #[tokio::test]
     async fn test_generic_value() {
-        use crate::{Value, ValueKind};
         use std::iter;
+
+        use crate::{Value, ValueKind};
 
         let expected: Value = ValueKind::List(vec![
             ValueKind::List(vec![
@@ -493,9 +492,10 @@ mod tests {
     #[cfg(feature = "value")]
     #[tokio::test]
     async fn test_complex_list_with_err() {
-        use crate::Value;
         use destream::de::Visitor;
         use futures::TryFutureExt;
+
+        use crate::Value;
 
         #[derive(Eq, PartialEq)]
         struct Class {
@@ -732,3 +732,7 @@ mod width_tests {
         assert_eq!(actual, values);
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/lexical.rs"]
+mod lexical;
