@@ -94,7 +94,7 @@ where
 
         loop {
             if let Some(current) = &mut this.current {
-                match ready!(current.as_mut().poll_next(cx)) {
+                match ready!(Pin::new(current).poll_next(cx)) {
                     Some(Ok(bytes)) => return Poll::Ready(Some(Ok(bytes))),
                     Some(Err(cause)) => return this.fail(cause),
                     None => this.current = None,
@@ -172,10 +172,10 @@ where
     T: IntoStream<'en> + 'en,
     S: Stream<Item = Result<Event<T>, super::Error>> + Send + 'en,
 {
-    Box::pin(Events {
+    futures::future::Either::Right(Box::pin(Events {
         source: Some(Box::pin(events)),
         current: None,
         frames: Vec::new(),
         root: false,
-    })
+    }))
 }
