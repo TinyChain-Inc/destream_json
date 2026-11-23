@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -248,5 +250,138 @@ fn ordinary_child_errors_and_cancellation_release_ownership() {
         assert!(observer.upgrade().is_some());
         drop(source);
         assert!(observer.upgrade().is_none());
+    });
+}
+
+const CASES: &[(&str, &[u8])] = &[
+    ("", b"\"\""),
+    ("ASCII/", b"\"ASCII/\""),
+    ("\"\\", b"\"\\\"\\\\\""),
+    ("\0\n\t\r\u{1f}", b"\"\\u0000\\u000a\\u0009\\u000d\\u001f\""),
+    ("λ雪", "\"λ雪\"".as_bytes()),
+];
+
+const FRAGMENTED: &[u8] = "\"a\\\"\\\\\\u000aλ\"".as_bytes();
+
+struct OwnedText(String);
+
+impl AsRef<str> for OwnedText {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+struct FormattedText<'a> {
+    parts: &'a [&'a str],
+    fail: bool,
+}
+
+impl fmt::Display for FormattedText<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for part in self.parts {
+            f.write_str(part)?;
+        }
+
+        if self.fail {
+            Err(fmt::Error)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[test]
+fn string_inputs_and_formatted_values_preserve_wire_bytes() {
+    block_on(async {
+        async fn check<'en>(text: impl AsRef<str> + Send + 'en, expected: &[u8]) {
+            assert_eq!(
+                encoded(crate::en::Encoder.encode_str(text).unwrap()).await,
+                expected
+            );
+        }
+
+        for &(text, expected) in CASES {
+            let borrowed = text.to_owned();
+            check(borrowed.as_str(), expected).await;
+            check(text.to_owned(), expected).await;
+            check(Arc::<str>::from(text), expected).await;
+            check(Box::<str>::from(text), expected).await;
+            check(Cow::Borrowed(text), expected).await;
+            check(Cow::<str>::Owned(text.to_owned()), expected).await;
+            check(OwnedText(text.to_owned()), expected).await;
+            assert_eq!(
+                encoded(crate::en::Encoder.collect_str(text).unwrap()).await,
+                expected
+            );
+        }
+
+        let stream = {
+            let formatted = FormattedText {
+                parts: &["a\"", "\\", "\n", "λ"],
+                fail: false,
+            };
+
+            crate::en::Encoder.collect_str(&formatted).unwrap()
+        };
+
+        assert_eq!(encoded(stream).await, FRAGMENTED);
+    });
+
+    let failed = FormattedText {
+        parts: &["partial\"\\"],
+        fail: true,
+    };
+
+    assert!(crate::en::Encoder.collect_str(&failed).is_err());
+}
+
+#[test]
+fn base64_writes_padded_wire_data_for_bytes_and_iterators() {
+    block_on(async {
+        for (input, expected) in [
+            (&b""[..], "\"\""),
+            (&b"f"[..], "\"Zg==\""),
+            (&b"fo"[..], "\"Zm8=\""),
+            (&b"foo"[..], "\"Zm9v\""),
+            (&b"foob"[..], "\"Zm9vYg==\""),
+            (&b"fooba"[..], "\"Zm9vYmE=\""),
+            (&b"foobar"[..], "\"Zm9vYmFy\""),
+            (&[251, 255][..], "\"+/8=\""),
+        ] {
+            let bytes = Bytes::copy_from_slice(input);
+            assert_eq!(
+                encoded(crate::en::Encoder.encode_bytes(bytes).unwrap()).await,
+                expected.as_bytes()
+            );
+
+            assert_eq!(
+                encoded(
+                    crate::en::Encoder
+                        .collect_bytes(input.iter().copied())
+                        .unwrap()
+                )
+                .await,
+                expected.as_bytes()
+            );
+        }
+
+        for len in [255, 256, 257, 4095, 4096, 4097] {
+            let input = (0..len).map(|n| n as u8).collect::<Vec<_>>();
+            let wire = encoded(
+                crate::en::Encoder
+                    .encode_bytes(Bytes::from(input.clone()))
+                    .unwrap(),
+            )
+            .await;
+
+            let decoded: Bytes = crate::try_decode(
+                (),
+                stream::iter([Ok::<_, crate::en::Error>(Bytes::from(wire))]),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(decoded.as_ref(), input);
+        }
     });
 }

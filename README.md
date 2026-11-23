@@ -26,3 +26,14 @@ With the `value` feature, `Value` owns a movable `ValueKind`. Use `kind`,
 `kind_mut`, or `into_kind` to inspect or change its contents, and `ValueKind::into`
 to construct it. Lists and maps retain their native containers. Cloning, comparison,
 formatting, destruction, decoding, and owned/borrowed encoding traverse iteratively.
+
+String scalars are escaped eagerly into one output buffer. `collect_str` writes
+formatted fragments directly into that buffer and returns formatting failures
+before producing a stream. Borrowed and owned string inputs use the same wire
+representation. Container children remain pull-driven.
+
+Numeric scalars format directly into their output buffer using Rust's `Display`
+representation; `f32` values are promoted to `f64` first. Booleans and null use
+static byte slices. Byte values are base64-encoded directly into their final
+quoted buffer; `collect_bytes` first gathers its byte iterator into owned input.
+Scalar output streams are boxed individually, including within numeric arrays.
