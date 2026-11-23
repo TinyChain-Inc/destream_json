@@ -195,7 +195,11 @@ impl<'en> en::Encoder<'en> for Encoder {
 
     #[inline]
     fn encode_bool(self, v: bool) -> Result<Self::Ok, Self::Error> {
-        Ok(encode_fmt(v))
+        Ok(encode_chunk(Bytes::from_static(if v {
+            TRUE
+        } else {
+            FALSE
+        })))
     }
 
     #[inline]
@@ -203,47 +207,59 @@ impl<'en> en::Encoder<'en> for Encoder {
         use base64::engine::general_purpose::STANDARD;
         use base64::engine::Engine;
 
-        self.encode_str(&STANDARD.encode(v.into()))
+        let value = v.into();
+        let len = base64::encoded_len(value.len(), true)
+            .and_then(|len| len.checked_add(2))
+            .ok_or_else(|| en::Error::custom("base64 output length overflow"))?;
+
+        let mut chunk = BytesMut::zeroed(len);
+        chunk[0] = QUOTE[0];
+        STANDARD
+            .encode_slice(&value, &mut chunk[1..len - 1])
+            .map_err(en::Error::custom)?;
+
+        chunk[len - 1] = QUOTE[0];
+        Ok(encode_chunk(chunk.freeze()))
     }
 
     #[inline]
     fn encode_i8(self, v: i8) -> Result<Self::Ok, Self::Error> {
-        Ok(encode_fmt(v))
+        encode_fmt(v)
     }
 
     #[inline]
     fn encode_i16(self, v: i16) -> Result<Self::Ok, Self::Error> {
-        Ok(encode_fmt(v))
+        encode_fmt(v)
     }
 
     #[inline]
     fn encode_i32(self, v: i32) -> Result<Self::Ok, Self::Error> {
-        Ok(encode_fmt(v))
+        encode_fmt(v)
     }
 
     #[inline]
     fn encode_i64(self, v: i64) -> Result<Self::Ok, Self::Error> {
-        Ok(encode_fmt(v))
+        encode_fmt(v)
     }
 
     #[inline]
     fn encode_u8(self, v: u8) -> Result<Self::Ok, Self::Error> {
-        Ok(encode_fmt(v))
+        encode_fmt(v)
     }
 
     #[inline]
     fn encode_u16(self, v: u16) -> Result<Self::Ok, Self::Error> {
-        Ok(encode_fmt(v))
+        encode_fmt(v)
     }
 
     #[inline]
     fn encode_u32(self, v: u32) -> Result<Self::Ok, Self::Error> {
-        Ok(encode_fmt(v))
+        encode_fmt(v)
     }
 
     #[inline]
     fn encode_u64(self, v: u64) -> Result<Self::Ok, Self::Error> {
-        Ok(encode_fmt(v))
+        encode_fmt(v)
     }
 
     #[inline]
@@ -254,7 +270,7 @@ impl<'en> en::Encoder<'en> for Encoder {
                 v
             )))
         } else {
-            Ok(encode_fmt(f64::from(v)))
+            encode_fmt(f64::from(v))
         }
     }
 
@@ -266,7 +282,7 @@ impl<'en> en::Encoder<'en> for Encoder {
                 v
             )))
         } else {
-            Ok(encode_fmt(v))
+            encode_fmt(v)
         }
     }
 
@@ -414,19 +430,29 @@ impl<'en> en::Encoder<'en> for Encoder {
     }
 
     #[inline]
-    fn encode_str(self, v: &str) -> Result<Self::Ok, Self::Error> {
+    fn encode_str<S: AsRef<str> + Send + 'en>(self, v: S) -> Result<Self::Ok, Self::Error> {
+        let v = v.as_ref();
         let mut chunk = BytesMut::with_capacity(v.len() + 2);
         chunk.extend_from_slice(QUOTE);
-        chunk.extend(escape(v));
+        write_escaped(&mut chunk, v);
         chunk.extend_from_slice(QUOTE);
-        Ok(Box::pin(futures::stream::once(future::ready(Ok(
-            chunk.into()
-        )))))
+        Ok(encode_chunk(chunk.freeze()))
+    }
+
+    fn collect_str<T: fmt::Display + ?Sized>(self, value: &T) -> Result<Self::Ok, Self::Error> {
+        let mut chunk = BytesMut::new();
+        chunk.extend_from_slice(QUOTE);
+        fmt::write(&mut Escaped(&mut chunk), format_args!("{value}"))
+            .map_err(|_| en::Error::custom("failed to format string"))?;
+
+        chunk.extend_from_slice(QUOTE);
+
+        Ok(encode_chunk(chunk.freeze()))
     }
 
     #[inline]
     fn encode_none(self) -> Result<Self::Ok, Self::Error> {
-        Ok(encode_fmt("null"))
+        Ok(encode_chunk(Bytes::from_static(NULL)))
     }
 
     #[inline]
@@ -436,7 +462,7 @@ impl<'en> en::Encoder<'en> for Encoder {
 
     #[inline]
     fn encode_unit(self) -> Result<Self::Ok, Self::Error> {
-        Ok(encode_fmt("null"))
+        self.encode_none()
     }
 
     #[inline]
@@ -476,7 +502,7 @@ impl<'en> en::Encoder<'en> for Encoder {
 
     #[inline]
     fn encode_uuid(self, uuid: Uuid) -> Result<Self::Ok, Self::Error> {
-        self.encode_str(&uuid.to_string())
+        self.collect_str(&uuid)
     }
 
     #[inline]
@@ -486,10 +512,8 @@ impl<'en> en::Encoder<'en> for Encoder {
 }
 
 #[inline]
-fn escape<T: fmt::Display>(value: T) -> Bytes {
-    let as_str = value.to_string();
-    let mut encoded = BytesMut::with_capacity(as_str.len());
-    for &byte in as_str.as_bytes() {
+fn write_escaped(encoded: &mut BytesMut, value: &str) {
+    for &byte in value.as_bytes() {
         match byte {
             b'"' | b'\\' => {
                 encoded.put_u8(b'\\');
@@ -509,14 +533,29 @@ fn escape<T: fmt::Display>(value: T) -> Bytes {
             _ => encoded.put_u8(byte),
         }
     }
+}
 
-    encoded.into()
+struct Escaped<'a>(&'a mut BytesMut);
+
+impl fmt::Write for Escaped<'_> {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        write_escaped(self.0, value);
+        Ok(())
+    }
 }
 
 #[inline]
-fn encode_fmt<'en, T: fmt::Display>(value: T) -> JSONStream<'en> {
-    let encoded = escape(value);
-    Box::pin(futures::stream::once(future::ready(Ok(encoded))))
+fn encode_fmt<'en, T: fmt::Display>(value: T) -> Result<JSONStream<'en>, Error> {
+    let mut encoded = BytesMut::new();
+    fmt::write(&mut encoded, format_args!("{value}"))
+        .map_err(|_| en::Error::custom("failed to format value"))?;
+
+    Ok(encode_chunk(encoded.freeze()))
+}
+
+#[inline]
+fn encode_chunk<'en>(chunk: Bytes) -> JSONStream<'en> {
+    Box::pin(futures::stream::once(future::ready(Ok(chunk))))
 }
 
 /// Given an encodable value, return an encoded stream.
