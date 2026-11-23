@@ -36,4 +36,5 @@ Numeric scalars format directly into their output buffer using Rust's `Display`
 representation; `f32` values are promoted to `f64` first. Booleans and null use
 static byte slices. Byte values are base64-encoded directly into their final
 quoted buffer; `collect_bytes` first gathers its byte iterator into owned input.
-Scalar output streams are boxed individually, including within numeric arrays.
+Completed scalar output is retained inline; asynchronous container streams remain
+boxed. `JSONStream` uses the standard `Either` stream representation.

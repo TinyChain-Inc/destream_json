@@ -171,14 +171,14 @@ pub fn encode_map<
 
 pub(super) fn encode_list_encoded<'en>(items: VecDeque<JSONStream<'en>>) -> JSONStream<'en> {
     let source = futures::stream::iter(items.into_iter().map(Ok));
-    Box::pin(JSONEncodingStream {
+    futures::future::Either::Right(Box::pin(JSONEncodingStream {
         source: source.fuse(),
         next: None,
         started: false,
         finished: false,
         start: LIST_BEGIN,
         end: LIST_END,
-    })
+    }))
 }
 
 pub(super) fn encode_map_encoded<'en>(
@@ -189,14 +189,14 @@ pub(super) fn encode_map_encoded<'en>(
             .into_iter()
             .map(|(key, value)| Ok(JSONMapEntryStream::from_streams(key, value))),
     );
-    Box::pin(JSONEncodingStream {
+    futures::future::Either::Right(Box::pin(JSONEncodingStream {
         source: source.fuse(),
         next: None,
         started: false,
         finished: false,
         start: MAP_BEGIN,
         end: MAP_END,
-    })
+    }))
 }
 
 #[cfg(test)]

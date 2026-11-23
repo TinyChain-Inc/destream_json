@@ -7,7 +7,6 @@ use std::pin::Pin;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use destream::en::{self, IntoStream};
-use futures::future;
 use futures::stream::{Stream, StreamExt};
 use uuid::Uuid;
 
@@ -17,7 +16,10 @@ mod events;
 mod stream;
 
 /// A [`Stream`] of JSON-encoded data
-pub type JSONStream<'en> = Pin<Box<dyn Stream<Item = Result<Bytes, Error>> + Send + Unpin + 'en>>;
+pub type JSONStream<'en> = futures::future::Either<
+    futures::stream::Iter<std::option::IntoIter<Result<Bytes, Error>>>,
+    Pin<Box<dyn Stream<Item = Result<Bytes, Error>> + Send + Unpin + 'en>>,
+>;
 
 /// An error encountered while encoding a stream.
 pub struct Error {
@@ -479,7 +481,9 @@ impl<'en> en::Encoder<'en> for Encoder {
         self,
         map: S,
     ) -> Result<Self::Ok, Self::Error> {
-        Ok(Box::pin(stream::encode_map(map)))
+        Ok(futures::future::Either::Right(Box::pin(
+            stream::encode_map(map),
+        )))
     }
 
     #[inline]
@@ -492,7 +496,9 @@ impl<'en> en::Encoder<'en> for Encoder {
         self,
         seq: S,
     ) -> Result<Self::Ok, Self::Error> {
-        Ok(Box::pin(stream::encode_list(seq)))
+        Ok(futures::future::Either::Right(Box::pin(
+            stream::encode_list(seq),
+        )))
     }
 
     #[inline]
@@ -555,7 +561,7 @@ fn encode_fmt<'en, T: fmt::Display>(value: T) -> Result<JSONStream<'en>, Error> 
 
 #[inline]
 fn encode_chunk<'en>(chunk: Bytes) -> JSONStream<'en> {
-    Box::pin(futures::stream::once(future::ready(Ok(chunk))))
+    futures::future::Either::Left(futures::stream::iter(Some(Ok(chunk))))
 }
 
 /// Given an encodable value, return an encoded stream.
